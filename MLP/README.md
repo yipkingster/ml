@@ -1,0 +1,1 @@
+This project implements a Multi-Layer Perceptron (MLP) using nothing but the JAX library.

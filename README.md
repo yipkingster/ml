@@ -1,1 +1,1 @@
-This repo lists all ML related experiment I have done.
+This repo lists all ML related projects I have done.
