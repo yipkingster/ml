@@ -2,7 +2,7 @@
 from jax import random
 import mlp
 
-
+# Run: /usr/bin/python3 /Users/kevinwang/Projects/ml/mlp_regression/mlp_main.py
 def main():
     # Setup
     key = random.PRNGKey(0)

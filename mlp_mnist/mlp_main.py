@@ -4,7 +4,7 @@ from jax import numpy as jnp
 import jax.nn
 import mlp
 
-
+# Run: /usr/bin/python3 /Users/kevinwang/Projects/ml/mlp_mnist/mlp_main.py
 def main():
     key = random.PRNGKey(0)
     # Input: 28x28=784
