@@ -24,7 +24,7 @@ def scaled_dot_product_attention(q, k, v, mask=None):
            This is for engineer's debugging purposes.
     """
     # 1. Calculate Raw Scores (The "Affinity/Similarity" matrix)
-    k_t = jnp.transpose(k, (0,2,1))
+    k_t = jnp.swapaxes(k, -2, -1)
     similarity_mx = jnp.matmul(q, k_t)
     
     # 2. Scale the scores
@@ -42,7 +42,7 @@ def scaled_dot_product_attention(q, k, v, mask=None):
     # 4. Softmax
     #    Apply jax.nn.softmax. BE CAREFUL with the 'axis'.
     #    We want the probabilities to sum to 1 across the *last* dimension (the keys).
-    attention_weights = jax.nn.softmax(masked_mx, 2)
+    attention_weights = jax.nn.softmax(masked_mx, -1)
  
     # 5. Weighted Sum
     #    Multiply weights with V.
