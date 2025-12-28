@@ -62,7 +62,7 @@ class MultiHeadAttention(nn.Module):
         k = self.split_heads(k)
         v = self.split_heads(v)
 
-        # 3. Scaled Dot Product Attention (Your function!)
+        # 3. Scaled Dot Product Attention
         # Note: scaled_dot_product_attention handles 4D input naturally
         attn_out, _ = sh_attention.scaled_dot_product_attention(q, k, v, mask)
 
