@@ -1,6 +1,6 @@
 from flax import linen as nn
 import jax.numpy as jnp
-import single_head_attention.attention as sh_attention
+from .single_head_attention import attention as sh_attention
 
 class MultiHeadAttention(nn.Module):
     d_model: int   # Total dimension (e.g., 512)
