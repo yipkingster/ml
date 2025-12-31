@@ -1,6 +1,7 @@
 from flax import linen as nn
+from jax import numpy as jnp
 import encoder_layer
-
+from positional_encoding import pos_encoding as pe
 class Encoder(nn.Module):
     vocab_size: int
     d_model: int
@@ -8,6 +9,7 @@ class Encoder(nn.Module):
     d_ff: int
     num_layers: int  # How many layers to stack (e.g., 6)
     dropout_rate: float = 0.1
+    max_len: int = 5000
 
     @nn.compact
     def __call__(self, x, mask, training: bool):
@@ -17,10 +19,12 @@ class Encoder(nn.Module):
         # Convert IDs to Vectors. Use nn.Embed(num_embeddings, features)
         # Initialized randomly.
         x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(x)
-        
-        # (Optional: Add Positional Encoding here - we will skip implementation for now 
-        # and just assume 'x' has position info, or you can just add zeros)
-        
+        # "In the embedding layers, we multiply those weights by sqrt(d_model)"
+        # - Vaswani et al.
+        x = x * jnp.sqrt(self.d_model)
+        # Add Positional Encoding.
+        x = pe.PositionalEncoding(self.d_model, self.max_len)(x)
+
         # 2. Dropout on Embeddings
         x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
         
