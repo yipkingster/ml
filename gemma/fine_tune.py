@@ -2,6 +2,8 @@ import dataclasses
 from recurrentgemma import jax as recurrentgemma 
 from flax.training import train_state
 import jax.numpy as jnp
+from recurrentgemma import common
+import itertools
 
 # Module 1: Creating a config.
 # @dataclasses.dataclass is a code generator that saves you time.
@@ -31,14 +33,55 @@ config = TrainingConfig()
 # In Flax, we don't just hold "weights" in a variable. We hold a TrainState
 # object that bundles the Parameters (weights) + Optimizer State (momentum, etc.).
 
+def _get2b_config(config):
+    """Get default RecurrentGemma 2B config."""
+    
+    # RecurrentGemma-2B (26 layers) follows a repeating pattern of 2 Recurrent 
+    # Layers followed by 1 Local Attention Layer.Pattern: Recurrent > Recurrent
+    # > Attention ... (repeat).
+    # Remainder: Since 26 isn't divisible by 3 (8 sets of 3 + 2 left over), it
+    # ends with Recurrent > Recurrent.
+    # Define the lay pattern (RECURRENT, RECURRENT, ATTENTION)
+    pattern = (
+        common.TemporalBlockType.RECURRENT,
+        common.TemporalBlockType.RECURRENT,
+        common.TemporalBlockType.ATTENTION
+    )
+    # Fill the list until we reach 26 layers
+    target_depth = 26
+    block_types = tuple(itertools.islice(itertools.cycle(pattern)), target_depth)
+
+    # Instantiate config:
+    griffin_config = recurrentgemma.GriffinConfig(
+        vocab_size=config.vocab_size,
+        width=2560,                      # d_model
+        mlp_expanded_width=7680,         # 3 x width
+        num_heads=10,                    # d_model 2560 / head_dimension 256
+        block_types = block_types,       # Tuple generated above
+        embeddings_scale_by_sqrt_dim=True,   # Standard Gemma scaling
+        attention_window_size=2048,
+        # This is a stability technique introduced in the Gemma 2 and
+        # RecurrentGemma family. It prevents the output numbers (logits) from 
+        # getting too large, which can cause the training loss to explode 
+        # (NaNs). It essentially "caps" the confidence of the model so it never 
+        # screams "I AM 100% SURE!" which helps training stability.
+        logits_soft_cap=30.0,            # Required for RecurrentGemma-2B
+        # The RG-LRU (Recurrent Gated Linear Recurrent Unit) is the
+        # "secret sauce" of the Griffin architecture. It is the component that
+        # allows RecurrentGemma to have a massive context length without running
+        # out of memory.
+        lru_width=2560,
+        scan_type=common.ScanType.AUTO
+    )
+
+    return griffin_config
+
 def create_train_state(rng, config):
     """Initializes the model, optimizer, and training state."""
     
     # 1. Setup Model Config
-    # HINT: Load GriffinConfig, then use dataclasses.replace to fix attention_window_size
-    # Expand the following line to ...GriffinConfig(vocab_size=config.vocab_size, ...)
-    model_config = recurrentgemma.GriffinConfig(vocab_size=config.vocab_size)
-    # TODO: Fix window size here
+    # Load GriffinConfig.
+    model_config = _get2b_config(config)
     
     # 2. Instantiate the Model
     model = recurrentgemma.Griffin(config=model_config)
