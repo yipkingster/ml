@@ -1,4 +1,6 @@
 import dataclasses
+import jax
+import optax
 from recurrentgemma import jax as recurrentgemma 
 from flax.training import train_state
 import jax.numpy as jnp
@@ -87,19 +89,22 @@ def create_train_state(rng, config):
     model = recurrentgemma.Griffin(config=model_config)
     
     # 3. Initialize Parameters
-    # HINT: You need a dummy input shape to trigger initialization.
+    # You need a dummy input shape to trigger initialization.
     # RecurrentGemma usually needs: tokens, segment_pos
     dummy_tokens = jnp.zeros((1, config.seq_len), dtype=jnp.int32)
     # TODO: Run model.init(...) to get 'params'
-    params = ... 
+    key = jax.random.key(0)
+    params = model.init(key, dummy_tokens, train=True) 
 
     # 4. Define Optimizer
-    # HINT: Use optax.adamw with the learning rate from config
-    tx = ... 
+    # Use optax.adamw with the learning rate from config
+    # See https://optax.readthedocs.io/en/latest/api/optimizers.html#optax.adamw
+    tx = optax.adamw(config.learning_rate)
 
     # 5. Create TrainState
     # This wrapper holds everything together.
-    # Note: We pass 'model' as a static field so we can use it inside the step function later.
+    # Note: We pass 'model' as a static field so we can use it inside the step
+    # function later.
     class TrainState(train_state.TrainState):
         model: recurrentgemma.Griffin = dataclasses.field(static=True, default=None)
 
