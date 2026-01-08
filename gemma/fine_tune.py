@@ -6,6 +6,7 @@ from flax.training import train_state
 import jax.numpy as jnp
 from recurrentgemma import common
 import itertools
+import loss_fn
 
 # Module 1: Creating a config.
 # @dataclasses.dataclass is a code generator that saves you time.
@@ -116,3 +117,37 @@ def create_train_state(rng, config):
     )
     
     return state
+
+@jax.jit
+def train_step(state, batch, rng):
+    """Updates the model parameters for a single step."""
+    
+    # 1. Handle RNG
+    # Split the incoming rng key to get a fresh one for dropout
+    dropout_rng, new_rng = jax.random.split(rng)
+    
+    # 2. Calculate Gradients
+    # HINT: usage is value_and_grad(fun)(params, ...)
+    # We defined loss_fn to take (params, state, ...), so we differentiate wrt arg 0
+    # jax.value_and_grad runs forward pass and derivative in one run to save
+    # compute resource, otherwise we need to run jax.grad(loss) and then run
+    # f(x) to get the value, which runs forward pass twice.
+    grad_fn = jax.value_and_grad(loss_fn.loss_fn, argnums=0)
+    loss, grads = grad_fn(state.params, state, batch, dropout_rng)
+    
+    # 3. Update State
+    # state.apply_gradients(grads=...) handles the optimizer update logic
+    new_state = state.apply_gradients(grads=grads)
+    
+    # loss isn't necessary for training itself but we return it to:
+    # 1. Serve as a dashboard to show how training is going.
+    #   If Loss goes DOWN: The model is learning.
+    #   If Loss stays FLAT: Something is broken (learning rate too low, bad data).
+    #   If Loss goes UP: The model is exploding (learning rate too high).
+    #   If Loss is NaN: You have a numerical error (precision issue).
+    # 2. Adjust or stop the training early:
+    #   ReduceLROnPlateau: "If the loss hasn't improved in 100 steps, cut the
+    #   learning rate by half."
+    #   Early Stopping: "If the loss hasn't improved in 1000 steps, stop
+    #   training completely to save money."
+    return new_state, loss, new_rng
