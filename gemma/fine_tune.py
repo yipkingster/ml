@@ -151,3 +151,22 @@ def train_step(state, batch, rng):
     #   Early Stopping: "If the loss hasn't improved in 1000 steps, stop
     #   training completely to save money."
     return new_state, loss, new_rng
+
+def train_loop(config, data_iterator):
+    # 1. Initialization
+    key = jax.random.PRKG(42)
+    key, new_key = key.split()
+    state = create_train_state(new_key, config)
+    print("State initialized. Starting training...")
+    
+    # 2. Loop
+    for step in range(config.num_steps):
+        # Fetch data (assuming data_iterator yields a dict)
+        batch = next(data_iterator)
+        # 3. Step
+        state, loss, key = train_step(state, batch, key)
+        
+        # 4. Logging
+        print(f"Step{step}, Loss{loss:.4f}")
+            
+    return state
