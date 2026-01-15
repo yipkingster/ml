@@ -18,7 +18,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from t5x import binary_search
+import binary_search
 
 _INT32_MIN = np.iinfo(np.int32).min
 _INT32_MAX = np.iinfo(np.int32).max

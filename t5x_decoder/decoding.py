@@ -1018,7 +1018,7 @@ class BeamState:
   cache: PyTree  # Any pytree of arrays, e.g. flax attention Cache object
   # Optional array of initial indices from which decoding starts, will be either
   # 0s if there is no prompt or None.
-  initial_index: jax.Array | None
+  initial_index: Optional[jax.Array]
 
 
 def beam_init(
