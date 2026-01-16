@@ -1604,7 +1604,7 @@ def diversed_beam_search(
       to the number of beams used in the beam search.
     alpha: float: scaling factor for brevity penalty.
     diversity_strength: float: strength of diversity penalty. The stronger, the 
-      less penalty for lack of diversity. According to the original paper, the
+      more penalty for lack of diversity. According to the original paper, the
       value is between 0.2 to 0.8.
     max_decode_len: int: an optional maximum length of decoded sequence. If
       None, it uses `inputs.shape[1]` as `max_decode_len`. This value ultimately
