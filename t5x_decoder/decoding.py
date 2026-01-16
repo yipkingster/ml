@@ -1567,3 +1567,76 @@ def beam_search(
     finished_seqs = finished_seqs[:, :, 1:]
 
   return finished_seqs, finished_scores
+
+def diversed_beam_search(
+    inputs: jnp.ndarray,
+    cache: Mapping[str, jnp.ndarray],
+    tokens_to_logits: Callable[
+        [DecodingState], Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]
+    ],
+    eos_id: int,
+    num_decodes: int = 4,
+    alpha: float = 0.6,
+    diversity_strength: float = 0.5,
+    max_decode_len: Optional[int] = None,
+    max_decode_step: int = -1,
+    min_log_prob: float = NEG_INF_VALUE,
+    cache_offset: int = 0,
+    initial_index: Optional[jnp.ndarray] = None,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """
+  Diverse beam search implementation. See https://arxiv.org/abs/1610.02424
+
+  Args:
+    inputs: array: [batch_size, length] int32 sequence of tokens.
+      e.g. If the prompt is "Translate: Hello" and the tokens are [350, 4200],
+      then:
+      input = jnp.array([0, 350, 4200, 0, 0, 0, 0, 0])
+      0: dummpy/BOS token
+      350: 'Translate'
+      4200: 'Hello'
+      0, 0, 0, 0, 0: Where the decoder will write the answer.
+    cache: flax attention cache. aka KV cache.
+    tokens_to_logits: fast autoregressive decoder function taking single token
+      slices and cache and returning next-token logits and updated cache.
+    eos_id: int: id of end-of-sentence token for target vocabulary.
+    num_decodes: number of decoded sequences to be returned. This is equivalent
+      to the number of beams used in the beam search.
+    alpha: float: scaling factor for brevity penalty.
+    diversity_strength: float: strength of diversity penalty. The stronger, the 
+      less penalty for lack of diversity. According to the original paper, the
+      value is between 0.2 to 0.8.
+    max_decode_len: int: an optional maximum length of decoded sequence. If
+      None, it uses `inputs.shape[1]` as `max_decode_len`. This value ultimately
+      depends on the task, e.g. 256 for summarisation, 2 * input for translation.
+    max_decode_step: int: maximum number of extra beam search steps allowed.
+      While using initial_index with prompts of variable lengths, max_decode_len
+      controls the output length, min_log_prob only stops the beam search if all
+      beam entries fail to pass the threshold, this will set a hard limit of
+      number of beam search steps to run. Useful to set a hard limit for the
+      serving latency.
+    min_log_prob: the beam search will stop if there is no live beam entry with
+      higher raw score (ignoring brevity penalty) than this.
+    cache_offset: axis offset for cache, arising from scanned layers.
+    initial_index: Optional[jnp.ndarray], the index from which to start decoding
+      autoregressively if set. If unset, then we teacher-force the prefix, but
+      autoregressively (so it will be slow). When set, this also assumes that
+      the cache is appropriately populated. Since inputs are padded on the left
+      with BOS = 0, these are also the lengths of the prompts.
+
+  Returns:
+     Tuple of:
+       [batch_size, beam_size, max_decode_len] top-scoring sequences
+       [batch_size, beam_size] beam-search scores.
+  """
+  batch_size = inputs.shape[0]
+  beam_size = num_decodes
+  beam_group_size = num_decodes
+  # This is a scalar array of the end marker token id. For boardcasting purposes.
+  # Note that the scalar array has shape of () - empty tuple. and jnp.isscalar()
+  # returns True.
+  end_marker = jnp.array(eos_id)
+
+  if max_decode_len is None:
+    max_decode_len = inputs.shape[1]
+  
