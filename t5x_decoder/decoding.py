@@ -1631,7 +1631,7 @@ def diversed_beam_search(
   """
   batch_size = inputs.shape[0]
   beam_size = num_decodes
-  beam_group_size = num_decodes
+  beam_group_size = beam_size
   # This is a scalar array of the end marker token id. For boardcasting purposes.
   # Note that the scalar array has shape of () - empty tuple. and jnp.isscalar()
   # returns True.
@@ -1639,4 +1639,49 @@ def diversed_beam_search(
 
   if max_decode_len is None:
     max_decode_len = inputs.shape[1]
+  # If the max_decode_len is set to bigger than the input length, we need to
+  # pad the input with BOS tokens to the max_decode_len.
+  if max_decode_len > inputs.shape[1]:
+    padding_length = max_decode_len - inputs.shape[1]
+    padding = jnp.zeros((batch_size, padding_length), dtype=jnp.int32)
+    inputs = jnp.concatenate([padding, inputs], axis=-1)
+  # We need to add 1 to the max_decode_len because we add 1 dummy token at the
+  # beginning of the sequence.
+  max_decode_len += 1
+  
+  right_aligned_input = None
+  live_seqs = None
+  if initial_index is not None:
+    # This means the prompt has already been read and the decoder will just
+    # start predicting the answer.abs
+    right_aligned_input = _right_align_prompts(inputs)
+    length = inputs.shape[1]
+    # right_aligned_input[:, -1] take all rows from the first dimension, and
+    # then takes only the last column from the second dimension (last token of
+    # the prompt).
+    # [0, None] adds a new dimension.
+    inputs = jnp.pad(right_aligned_input[:, -1][:, None],
+                     # (0, 0) adds no padding to the first dimension.
+                     # (0, length - 1) adds (length - 1) padding to the second
+                     # dimension. Note that we already have the first token of
+                     # the prompt, so we only need to add (length - 1) padding.
+                     # This makes total size of "length" because we need a EOS
+                     # token at the end.
+                     ((0, 0), (0, length - 1)),
+                     constant_values=0)
+    
+    live_seqs = jnp.pad(right_aligned_input[:, -1][:, None],
+                        ((0, 0), (0, max_decode_len-1)),
+                        constant_values=0)
+    
+    
+    live_seqs = jnp.expand_dims(live_seqs, axis=1)
+    live_seqs = jnp.broadcast_to(
+        # We want to explore on every beam group, which at sthis point is just
+        # the same as the beam size.
+        live_seqs, (live_seqs.shape[0], beam_group_size, live_seqs.shape[-1])
+    )
+  else:
+    initial_index = jnp.zeros((batch_size,), dtype=jnp.int32)
+
   
