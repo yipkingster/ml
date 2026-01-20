@@ -1031,8 +1031,13 @@ def beam_init(
     initial_index: Optional[jnp.ndarray] = None,
 ) -> BeamState:
   """Initializes the beam search state data structure."""
+  # The 0-dimensional array with value 0. This allows easier access and 
+  # compatible broadcast.
   cur_index0 = jnp.array(0)
   live_logprobs0 = jnp.tile(
+      # Python list math: [NEG_INF] * n becomes n elements of NEG_INF.
+      # [0.0] + [NEG_INF, NEG_INF, ...] is concatenation and becomes
+      # [0.0, NEG_INF, NEG_INF, ...]
       jnp.array([0.0] + [NEG_INF] * (beam_size - 1)), [batch_size, 1]
   )
   finished_scores0 = jnp.ones((batch_size, beam_size)) * NEG_INF
@@ -1684,4 +1689,13 @@ def diversed_beam_search(
   else:
     initial_index = jnp.zeros((batch_size,), dtype=jnp.int32)
 
-  
+  # initialize diverse beam search state
+  beam_search_init_state = beam_init(
+      batch_size,
+      beam_size,
+      max_decode_len,
+      cache,
+      cache_offset,
+      live_seqs=live_seqs,
+      initial_index=initial_index,
+  )
