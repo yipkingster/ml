@@ -1050,6 +1050,7 @@ def beam_init(
       else jnp.zeros((batch_size, beam_size, max_decode_len), jnp.int32)
   )
   finished_seqs0 = jnp.zeros((batch_size, beam_size, max_decode_len), jnp.int32)
+  # Marks which beam search has finished.
   finished_flags0 = jnp.zeros((batch_size, beam_size), jnp.bool_)
   # add beam dimension to attention cache pytree elements
   # We will have to expand the cache_index if we're given an initial prompt that
@@ -1699,3 +1700,17 @@ def diversed_beam_search(
       live_seqs=live_seqs,
       initial_index=initial_index,
   )
+
+  def beam_search_loop_cond_fn(state: BeamState) -> jax.array:
+    """Beam search loop termination condition."""
+    # Have we reached max decoding length?
+    # Since we might be starting at different points in the prompts, let's use
+    # the minimum prompt length to stop conservatively.
+    #
+    # This is a counter that count "steps" so far, since different batches have
+    # different length, we took the minimum length so the longest path will be
+    # satified when we compare this counter to max_decode_len.
+    cur_index = state.cur_index + jnp.min(state.initial_index)
+    # Because we mutate the "i+1" position, we stop one token before the end.
+    # cur_index is the position we "look back at" to generate at cur_index + 1.
+    not_at_end = cur_index < max_decode_len - 1
