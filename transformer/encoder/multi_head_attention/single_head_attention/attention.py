@@ -44,6 +44,7 @@ def scaled_dot_product_attention(q, k, v, mask=None):
     # 3. Apply Mask (Optional for now, but good to know)
     # If mask is provided, set masked positions to -1e9 before softmax. Note
     # that exp(-1e9) is approximately 0.
+    # Those numbers before softmax applies exp() to them are called logits.
     large_negative = -1e9
     masked_mx = jnp.where(mask==True, scaled_s_mx, large_negative) if mask!=None else scaled_s_mx
 
