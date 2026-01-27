@@ -25,12 +25,13 @@ class MultiHeadAttention(nn.Module):
         """
         batch_size = x.shape[0]
         # Split the d_model to d_k and get one more head dimension.
-        x =x.reshape(batch_size, -1, self.num_heads, self.d_k)
+        x = x.reshape(batch_size, -1, self.num_heads, self.d_k)
         # Alternative: specify seq_size and use jnp.reshape()
         # seq_size = x.shape[1]
-        # x = jnp.reshape(batch_size, seq_size, self.num_heads, self.d_k)
+        # x = jnp.reshape(x, (batch_size, seq_size, self.num_heads, self.d_k))
 
-        # Transpose the head dimension out of the last 2. The last 2 should be seq and d_k so matmul can apply to them.
+        # Transpose the head dimension out of the last 2. The last 2 should be
+        # seq and d_k so matmul can apply to them.
         # Tranpose [batch, seq, head, d_k] into [batch, head, seq, d_k]
         x = x.transpose(0, 2, 1, 3)
         # Alternative:

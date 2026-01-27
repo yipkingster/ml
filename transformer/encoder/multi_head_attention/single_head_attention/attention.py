@@ -4,23 +4,27 @@ import jax.numpy as jnp
 def scaled_dot_product_attention(q, k, v, mask=None):
     """
     Computes the attention scores and context vector.
+    Note that this function only operates on the last 2 dimentsion of all q, k
+    and v so it doesn't matter q, k or v have 3 or 4 dimensions. They just need
+    to have the same shapes.
     
     Args:
-        q: Queries. Shape (batch, seq_len, d_q)
+        q: Queries. Shape (batch, seq_len, d_q) or (batch, head, seq_len, d_q)
            e.g., (Batch 32, Sequence 50 words, Dimension 64)
            Batch: 32 independent sentences to analyze.
            Sequence: Content Vector of the first 50 words of each sentence.
            Dimension: 64 floats as embedding for each word.
-        k: Keys. Shape (batch, seq_len, d_k)
+        k: Keys. Shape (batch, seq_len, d_k) or (batch, head, seq_len, d_k)
            Same batch but different embeddings to represent keys (semantic info,
            adj, noun, etc).
-        v: Values. Shape (batch, seq_len, d_v)
+        v: Values. Shape (batch, seq_len, d_v) or (batch, head, seq_len, d_v)
            Same batch but different embeddings to represent values (content
            info, as "he" means man, male)
         mask: Optional boolean mask (batch, seq_len, seq_len) to hide padding.
         
     Returns:
-        output: The context vector. Shape (batch, seq_len, d_v)
+        output: The context vector. Shape (batch, seq_len, d_v) or 
+           (batch, head, seq_len, d_v)
            Context vector to hold "relatedness" between a word in the sentence 
            with all other words in the same sentence.
         attention_weights: The raw probability scores. Shape (batch, seq_len, 

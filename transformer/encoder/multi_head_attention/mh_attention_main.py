@@ -27,9 +27,39 @@ def run_multihead_tests():
     
     # 3. Initialize the Weights (Flax Pattern)
     # This triggers 'setup()' and creates the parameter dictionary.
+    # init() will use dummy input to figure out the shapes of the weights. Then
+    # it will use the random key to initialize the weights.
+    # e.g. The Flax knows the output has dimension of 512 (d_model), since it
+    # sees the input x has dimension of 512, it knows the weight matrix should
+    # be (512, 512).
     variables = model.init(key2, x, x, x)
     
     # --- TEST 1: Variable Shapes (Did we create the right matrices?) ---
+    # The structure of the variables is a "PyTree" (dictionary of dictionaries).
+    # e.g. 
+    # {
+    #     'params': {
+    #         'W_q': {
+    #         'kernel': <jax.Array shape=(512, 512)>,  # The weight matrix
+    #         'bias':   <jax.Array shape=(512,)>       # The bias vector
+    #         },
+    #         'W_k': {
+    #         'kernel': <jax.Array shape=(512, 512)>,
+    #         'bias':   <jax.Array shape=(512,)>
+    #         },
+    #         'W_v': {
+    #         'kernel': <jax.Array shape=(512, 512)>,
+    #         'bias':   <jax.Array shape=(512,)>
+    #         },
+    #         'W_o': {
+    #         'kernel': <jax.Array shape=(512, 512)>,
+    #         'bias':   <jax.Array shape=(512,)>
+    #         }
+    #     }
+    # }
+    # Note that "kernel" is the JAX/Flax name for weight matrix.
+    # W_q, W_k, W_v, W_o are coming from the model's setup() function.
+    
     print("--- Test 1: Weight Matrix Shapes ---")
     params = variables['params']
     
