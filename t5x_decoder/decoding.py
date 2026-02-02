@@ -1702,7 +1702,7 @@ def diversed_beam_search(
   )
 
   def beam_search_loop_cond_fn(state: BeamState) -> jax.array:
-    """Beam search loop termination condition."""
+    """Beam search loop continuation condition."""
     # Have we reached max decoding length?
     # Since we might be starting at different points in the prompts, let's use
     # the minimum prompt length to stop conservatively.
