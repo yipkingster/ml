@@ -1010,8 +1010,7 @@ class BeamState:
   finished_scores: jax.Array  # float32: [batch_size, beam_size]
   # The current active-beam-searching and finished sequences.
   live_seqs: jax.Array  # int32: [batch_size, beam_size, max_decode_len]
-  finished_seqs: jax.Array  # int32: [batch_size, beam_size,
-  #                                         max_decode_len]
+  finished_seqs: jax.Array  # int32: [batch_size, beam_size, max_decode_len]
   # Records which of the 'finished_seqs' is occupied and not a filler slot.
   finished_flags: jax.Array  # bool: [batch_size, beam_size]
   # The current state of the autoregressive decoding caches.
@@ -1659,7 +1658,8 @@ def diversed_beam_search(
   live_seqs = None
   if initial_index is not None:
     # This means the prompt has already been read and the decoder will just
-    # start predicting the answer.abs
+    # start predicting the answer.
+    # TODO: Exercise both right align algorithms.
     right_aligned_input = _right_align_prompts(inputs)
     length = inputs.shape[1]
     # right_aligned_input[:, -1] take all rows from the first dimension, and
@@ -1709,8 +1709,60 @@ def diversed_beam_search(
     #
     # This is a counter that count "steps" so far, since different batches have
     # different length, we took the minimum length so the longest path will be
-    # satified when we compare this counter to max_decode_len.
+    # satisfied when we compare this counter to max_decode_len.
     cur_index = state.cur_index + jnp.min(state.initial_index)
     # Because we mutate the "i+1" position, we stop one token before the end.
     # cur_index is the position we "look back at" to generate at cur_index + 1.
     not_at_end = cur_index < max_decode_len - 1
+    exceed_max_decode_step = max_decode_step > 0 and jnp.all(
+      state.cur_index >= max_decode_step
+    )
+
+    # Here the max_decode_len is used because we only use it to calucate if we
+    # want to terminate the search early. So we use the "optimistic" penalty.
+    # If with this optimistic panelty a beam search still can't beat a finished
+    # sequence, then it's not worth continuing the search.
+    min_brevity_penalty = brevity_penalty(state.alpha, max_decode_len)
+    # Normalize the live scores by dividing the min_brevity_penalty. This is to 
+    # measure the "average goodness" of every word. 
+    # We don't divide by the simple length because brevity penalty is the
+    # mathematically best balance to avoid swinging to reward infinitely long
+    # sequences.
+    best_live_scores = state.live_logprobs[:, -1:] / min_brevity_penalty
+    # Get the worst finished scores:
+    worst_finished_score =jnp.min(
+      state.finished_scores, axis=1, keepdims=True
+    )
+
+    # If a beam is not finished, set the slots to -inf.
+    # Technically this is redundant because the finished_scores are initialized
+    # to -inf.
+    worst_finished_score = jnp.where(
+      state.finished_flags, worst_finished_score, NEG_INF
+    )
+
+    # If the best live score is already worse than the worst finished score,
+    # then we can terminate the search.
+    search_terminated = jnp.all(best_live_scores < worst_finished_score)
+
+    # If all the best live scores are worse than the minimum acceptable score,
+    # then we can terminate the search. 
+    # This could happen if min_log_prob is set to bigger than NEG_INF when we
+    # want to save compute resources when the end result is hopeless to finish.
+    min_scores = min_log_prob / min_brevity_penalty
+    all_min_scores_test_failed = jnp.all(
+      # Please note we use bitwise "&" because JIT compiler overload it to allow
+      # JAX arrays and tracers to be evaulated at the runtime in TPU/GPU. If we
+      # use "and", it will crash because the values are unknown at compile time.
+      # Also note that "&" doesn't shortcircuit so both parts are evaulated.
+      # This is why we need to check state.cur_index > 0.
+      (min_scores < worst_finished_score) & (state.cur_index > 0)
+    )
+    
+    # Loop will continue if returning true.
+    return (
+      not_at_end
+      & (~exceed_max_decode_step)
+      & (~search_terminated) 
+      & (~all_min_scores_test_failed)
+    )
