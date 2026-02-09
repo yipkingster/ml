@@ -739,9 +739,14 @@ def brevity_penalty(alpha: float, length: int) -> jnp.ndarray:
 def cache_map(fn, cache, apply_to_index: bool = False):
   """Maps function over that caches, even multiple caches in various layers.
 
+  Initial Leaf Shape: [2, 4, 8, 512, 64] (Batch=2, Beam=4, Heads=8, Len=512, Dim=64)
+  Flattened Leaf Shape: [8, 8, 512, 64] (Total Beams=8, Heads=8, Len=512, Dim=64)
+
   Args:
     fn: The function to apply.
-    cache: The cache to apply it to.
+    cache: The cache to apply it to. It is a PyTree, a complex
+      dictionary/structure containing many nested tensors for every layer's Key
+      and Value heads.
     apply_to_index: Whether to apply the function to the cache index.
 
   Returns:
@@ -1583,6 +1588,7 @@ def diversed_beam_search(
     num_decodes: int = 4,
     alpha: float = 0.6,
     diversity_strength: float = 0.5,
+    num_beam_grps: int = 1,
     max_decode_len: Optional[int] = None,
     max_decode_step: int = -1,
     min_log_prob: float = NEG_INF_VALUE,
@@ -1611,6 +1617,11 @@ def diversed_beam_search(
     diversity_strength: float: strength of diversity penalty. The stronger, the 
       more penalty for lack of diversity. According to the original paper, the
       value is between 0.2 to 0.8.
+    num_beam_grps: int: number of beam groups. The beam search will be performed
+      in `num_beam_grps` groups, and the top `num_decodes // num_beam_grps`
+      beams will be selected from each group, so the total bean number is still
+      num_decodes. Note that if num_beam_grps <= 1, it will be set to 1. If the
+      num_beam_grps > num_decodes, it will be set to num_decodes.
     max_decode_len: int: an optional maximum length of decoded sequence. If
       None, it uses `inputs.shape[1]` as `max_decode_len`. This value ultimately
       depends on the task, e.g. 256 for summarisation, 2 * input for translation.
@@ -1636,7 +1647,11 @@ def diversed_beam_search(
   """
   batch_size = inputs.shape[0]
   beam_size = num_decodes
-  beam_group_size = beam_size
+  if num_beam_grps <= 1:
+    num_beam_grps = 1
+  elif num_beam_grps > beam_size:
+    num_beam_grps = beam_size
+  beam_group_size = beam_size // num_beam_grps
   # This is a scalar array of the end marker token id. For boardcasting purposes.
   # Note that the scalar array has shape of () - empty tuple. and jnp.isscalar()
   # returns True.
@@ -1766,3 +1781,101 @@ def diversed_beam_search(
       & (~search_terminated) 
       & (~all_min_scores_test_failed)
     )
+
+  def diverse_beam_search_top_k(
+    logprobs: jnp.ndarray,
+    beams_to_keep: int,
+    beam_size: int,
+    diversity_strength: float,
+    num_beam_grps: int,
+  ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Diverse beam search top-k.
+
+    Args:
+      logprobs: [batch, beam, vocab_size]
+      beams_to_keep: number of beams to keep, usually 2 * beam_size
+      beam_size: number of beams
+      diversity_strength: diversity strength.
+      num_beam_grps: number of beam groups
+    """
+    # Shape of logprobs: [batch, beam, vocab_size]
+    # divide the input into groups
+    # Shape of groups: [batch, num_groups, group_size, vocab_size]
+    size_per_group = beam_size // num_beam_grps
+    last_group_size = beam_size % group_size
+    groups = jnp.array_split(logprobs, group_size, axis=1)
+    
+    # Run top_k for the first group
+    # Gather the top 2*K1 scores from _all_ beams, K1 = K/num_beam_grps
+    # --> [batch, 2*K1], [batch, 2*K1]
+    first_topk_log_probs, first_topk_indices = top_k_two_stage(
+        groups[0], k=beams_to_keep // num_beam_grps
+    )
+    # Get the actual token ids
+    first_topk_ids = first_topk_indices % vocab_size
+    # TODO: Build the penalty function.
+    # Combine the results
+    
+  def beam_search_loop_body_fn(state: BeamState) -> BeamState:
+    """Beam search loop body function."""
+    flat_cur_tokens = lax.dynamic_slice(
+      # Source array [batch, beam, seq_len]
+      state.live_seqs,
+      # Start index [batch, beam, seq]
+      (0, 0, state.cur_index),
+      # Slice size [batch, beam, 1]
+      (batch_size, beam_size, 1)
+    )
+
+    # TODO: Exercise flatten_beam_dim function
+    # This flatten the cache PyTree before feeding into the model.
+    flat_cache = cache_map(
+        functools.partial(flatten_beam_dim, offset=cache_offset), state.cache
+    )
+
+    decoding_state = DecodingState(
+      cur_index = state.cur_index,
+      sequences = flatten_beam_dim(state.live_seqs),
+      cur_tokens = flat_cur_tokens,
+      cache = flat_cache,
+    )
+
+    flat_logits, new_flat_cache = tokens_to_logits(decoding_state)
+    
+    logits = unflatten_beam_dim(flat_logits, batch_size, beam_size)
+
+    new_cache = cache_map(
+      lambda x: unflatten_beam_dim(x, batch_size, beam_size, offset=cache_offset),
+      new_flat_cache
+    )
+
+    candidate_logprobs = jnp.log_softmax(logits, axis=-1)
+    # state.live_logprobs shape: [batch, beam]
+    # candidate_logprobs shape: [batch, beam, vocab_size]
+    # We need to add them together, so we need to expand the dimensions of
+    # state.live_logprobs to [batch, beam, 1]
+    logprobs = candidate_logprobs + jnp.expand_dims(state.live_logprobs, axis=2)
+
+    # TODO: Now DBS: We will have G groups and each group has B/G candidates.
+    # For G1: Usual beam search
+    # For G2: Add diversity penalty to the new token that G1 picked. Pick B/G
+    # best candidates from G2.
+    # For G3: Add diversity penalty to the new token that G1 and G2 picked. Pick
+    # B/G best candidates from G3.
+    # ...
+    # Now the total number of candidates is still B since we picked B/G from G
+    # groups.
+    # TODO: Understand Math symbols in the original paper using Gemini.
+    
+    vocab_size = logprobs.shape[-1]
+
+    flattened_logprobs = logprobs.reshape((batch_size, beam_size * vocab_size))
+    beams_to_keep = 2 * beam_size
+    top_k_logprobs, top_k_indices = diverse_beam_search_top_k(
+      flattened_logprobs,
+      beams_to_keep,
+      beam_size,
+      diversity_strength,
+      num_beam_grps,
+    )
+
