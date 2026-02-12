@@ -1800,21 +1800,40 @@ def diversed_beam_search(
     """
     # Shape of logprobs: [batch, beam, vocab_size]
     # divide the input into groups
-    # Shape of groups: [batch, num_groups, group_size, vocab_size]
-    size_per_group = beam_size // num_beam_grps
-    last_group_size = beam_size % group_size
-    groups = jnp.array_split(logprobs, group_size, axis=1)
+    # Type of groups: list of [batch, group_size, vocab_size]
+    groups = jnp.array_split(logprobs, num_beam_grps, axis=1)
     
     # Run top_k for the first group
     # Gather the top 2*K1 scores from _all_ beams, K1 = K/num_beam_grps
     # --> [batch, 2*K1], [batch, 2*K1]
-    first_topk_log_probs, first_topk_indices = top_k_two_stage(
+    cur_topk_log_probs, cur_topk_indices = top_k_two_stage(
         groups[0], k=beams_to_keep // num_beam_grps
     )
     # Get the actual token ids
-    first_topk_ids = first_topk_indices % vocab_size
-    # TODO: Build the penalty function.
-    # Combine the results
+    cur_token_ids = cur_topk_indices % vocab_size
+
+    for i in range(1, num_beam_grps):
+      # Get the new group logprobs via the current top-k logprobs
+      # TODO: Build the penalty function.
+      new_group_logprobs = update_logprobs_with_prev_group(
+        groups[i],
+        cur_token_ids,
+        diversity_strength,
+      )
+      # Get top-k logprobs of the new group
+      new_topk_log_probs, new_topk_indices = top_k_two_stage(
+        new_group_logprobs, k=beams_to_keep // num_beam_grps
+      )
+      # Merge with the current logprobs
+      cur_topk_log_probs = jnp.concatenate(
+        [cur_topk_log_probs, new_topk_log_probs], axis=-1
+      )
+      cur_topk_indices = jnp.concatenate(
+        [cur_topk_indices, new_topk_indices], axis=-1
+      )
+      cur_token_ids = cur_topk_indices % vocab_size
+    
+    # Out of the loop: cur_topk_log_probs is the one to continue with.
     
   def beam_search_loop_body_fn(state: BeamState) -> BeamState:
     """Beam search loop body function."""
