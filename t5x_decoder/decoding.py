@@ -1782,6 +1782,23 @@ def diversed_beam_search(
       & (~all_min_scores_test_failed)
     )
 
+  def update_logprobs_with_prev_group(
+    logprobs: jnp.ndarray,
+    prev_token_ids: jnp.ndarray,
+    diversity_strength: float,
+  ) -> jnp.ndarray:
+    """Update logprobs with previous group."""
+    # Shape of logprobs: [batch, beam_group_size, vocab_size]
+    # Shape of prev_token_ids: [batch, previous_groups_total_size]
+    # Shape of occurences_one_hot: [batch, previous_groups_total_size, vocab_size]
+    # Create one hot from tokens chosen from previous groups.
+    occurences_one_hot = jax.nn.one_hot(prev_token_ids, vocab_size)
+    # Sum the one hot vectors to get the frequency of each token.
+    token_frequency = jnp.sum(occurences_one_hot, axis=1)
+    # Update logprobs for each vocab by subtracting the penalty.
+    logprobs -= diversity_strength * jnp.expand_dims(token_frequency, axis=1)
+    return logprobs
+
   def diverse_beam_search_top_k(
     logprobs: jnp.ndarray,
     beams_to_keep: int,
@@ -1802,12 +1819,12 @@ def diversed_beam_search(
     # divide the input into groups
     # Type of groups: list of [batch, group_size, vocab_size]
     groups = jnp.array_split(logprobs, num_beam_grps, axis=1)
-    
+    beam_group_size = beam_size // num_beam_grps
     # Run top_k for the first group
     # Gather the top 2*K1 scores from _all_ beams, K1 = K/num_beam_grps
     # --> [batch, 2*K1], [batch, 2*K1]
     cur_topk_log_probs, cur_topk_indices = top_k_two_stage(
-        groups[0], k=beams_to_keep // num_beam_grps
+        groups[0], k=beam_group_size
     )
     # Get the actual token ids
     cur_token_ids = cur_topk_indices % vocab_size
@@ -1822,7 +1839,7 @@ def diversed_beam_search(
       )
       # Get top-k logprobs of the new group
       new_topk_log_probs, new_topk_indices = top_k_two_stage(
-        new_group_logprobs, k=beams_to_keep // num_beam_grps
+        new_group_logprobs, k=beam_group_size
       )
       # Merge with the current logprobs
       cur_topk_log_probs = jnp.concatenate(
