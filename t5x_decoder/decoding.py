@@ -1850,6 +1850,8 @@ def diversed_beam_search(
       )
       cur_token_ids = cur_topk_indices % vocab_size
     
+    return cur_topk_log_probs, cur_topk_indices
+    
     # Out of the loop: cur_topk_log_probs is the one to continue with.
     
   def beam_search_loop_body_fn(state: BeamState) -> BeamState:
