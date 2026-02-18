@@ -1851,7 +1851,7 @@ def diversed_beam_search(
       cur_token_ids = cur_topk_indices % vocab_size
     
     return cur_topk_log_probs, cur_topk_indices
-    
+
     # Out of the loop: cur_topk_log_probs is the one to continue with.
     
   def beam_search_loop_body_fn(state: BeamState) -> BeamState:
@@ -1917,3 +1917,129 @@ def diversed_beam_search(
       num_beam_grps,
     )
 
+    # At this point, top_k_indices is still flattened. Here we get the
+    # top_k_tokens by doing mod. Later, we will do ceiling division to get the 
+    # beam groups.
+    top_k_tokens = top_k_indices % vocab_size
+    # Get the next input token from the original input.
+    # Shape of input: [batch, seq_len]
+    # Shape of next_input_token: [batch, 1]
+    next_input_token = jnp.expand_dims(input, axis=1).astype(jnp.int32)[
+      :, :, state.cur_index + 1
+    ]
+    # Check if the next input token is the padding token (0). If so, we are out
+    # of the prompt and can stop teacher forcing.
+    # Shape of out_of_prompt: [batch, 1]
+    out_of_prompt = next_input_token == 0
+
+    # Set of the first beam logprob to 0 and rest of them to -INF so only one
+    # beam is alive during teacher forcing.
+    inside_prompt = jnp.concatenate(
+      [
+        jnp.zeros((batch_size, 1), dtype=top_k_logprobs.dtype),
+        jnp.full_like(top_k_logprobs[:, : beams_to_keep-1], NEG_INF),
+      ],
+      axis=1,    
+    )
+
+    top_k_logprobs = (top_k_logprobs * ~out_of_prompt + 
+                      inside_prompt * out_of_prompt)
+    topk_ids = (next_input_token * ~out_of_prompt + 
+                      topk_ids * out_of_prompt)
+
+    # Expand the dimensions of topk_ids to [batch, beams_to_keep, 1] for
+    # broadcasting.
+    topk_ids = jnp.expand_dims(topk_ids, axis=2)
+    
+    # Recovers the beam indices by doing ceiling division.
+    topk_beam_indices = top_k_indices // vocab_size
+
+    topk_seqs = gather_beams(
+      state.live_seqs,
+      topk_beam_indices,
+      batch_size,
+      beam_size,
+      beams_to_keep,
+    )
+
+    # Update top K seqes by adding the new tokens.
+    # Shape of topk_seqs: [batch, beams_to_keep, seq_len]
+    # Shape of topk_ids: [batch, beams_to_keep, 1]
+    topk_seqs = lax.dynamic_update_slice(
+      topk_seqs,
+      topk_ids,
+      (0, 0, state.cur_index + 1),
+    )
+
+    # The following code will keep 2K active seqs
+    newly_finished = topk_seqs[:, :, state.cur_index + 1] == end_marker
+
+    # Prevent those finished seqs from being added to the live seqs.
+    # We add -INF to the logprobs of the finished seqs so they won't be
+    # selected again.
+    new_logprobs = top_k_logprobs + newly_finished * NEG_INF
+
+    _, new_topk_indices = lax.top_k(new_logprobs, k=beam_size)
+    new_topk_indices = jnp.flip(new_topk_indices, axis=1)
+
+    top_alive_seqs, top_alive_log_probs = gather_beams(
+      [topk_seqs, new_logprobs],
+      new_topk_indices,
+      batch_size,
+      beam_size,
+      beams_to_keep,
+    )
+
+    top_alive_indices = gather_beams(
+      topk_beam_indices,
+      new_topk_indices,
+      batch_size,
+      2 * beam_size,
+      beam_size,
+    )
+
+    top_alive_cache = cache_gather_beams(
+      state.cache,
+      top_alive_indices,
+      batch_size,
+      beam_size,
+      beam_size,
+      True,
+      offset=cache_offset,
+    )
+
+    # The following code will store the finished sequences.
+    finished_seqs = jnp.concatenate(
+      [state.finished_seqs, topk_seqs],
+      axis=1,
+    )
+    finished_scores = jnp.concatenate(
+      [state.finished_scores, new_scores],
+      axis=1,
+    )
+    finished_flags = jnp.concatenate(
+      [state.finished_flags, newly_finished],
+      axis=1,
+    )
+
+    top_finished_seq, top_finished_scores, top_finished_flags = (
+      gather_topk_beams(
+        [finished_seqs, finished_scores, finished_flags],
+        finished_scores,
+        batch_size,
+        beam_size,
+      )
+    )
+
+    return BeamState(
+        cur_index=state.cur_index + 1,
+        live_logprobs=top_alive_log_probs,
+        finished_scores=top_finished_scores,
+        live_seqs=top_alive_seq,
+        finished_seqs=top_finished_seq,
+        finished_flags=top_finished_flags,
+        cache=top_alive_cache,
+        initial_index=initial_index,
+    )
+
+    
