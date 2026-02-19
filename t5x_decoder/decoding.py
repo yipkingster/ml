@@ -2035,11 +2035,74 @@ def diversed_beam_search(
         cur_index=state.cur_index + 1,
         live_logprobs=top_alive_log_probs,
         finished_scores=top_finished_scores,
-        live_seqs=top_alive_seq,
+        live_seqs=top_alive_seqs,
         finished_seqs=top_finished_seq,
         finished_flags=top_finished_flags,
         cache=top_alive_cache,
         initial_index=initial_index,
     )
 
-    
+  final_state = lax.while_loop(
+    beam_search_loop_cond_fn,
+    beam_search_loop_body_fn,
+    initial_state,
+  )
+
+  any_finished = jnp.any(final_state.finished_flags, axis=1)
+  # --> [batch, beams, seqs]
+  finished_seqs = jnp.where(
+    any_finished[:, None, None],
+    final_state.finished_seqs,
+    final_state.live_seqs,
+  )
+
+  # --> [batch, beams]
+  finished_scores = jnp.where(
+    any_finished[:, None],
+    final_state.finished_scores,
+    final_state.live_logprobs,
+  )
+
+  finished_flags = jnp.where(
+    any_finished[:, None],
+    final_state.finished_flags,
+    jnp.ones_like(final_state.finished_flags),
+  )
+
+  # Construct the output from the right aligned prompt.
+  if right_aligned_input is not None:
+    # We have the last token and finished seqs.
+    # We need to get rid of the last token and add the finished seqs and remove
+    # the paddings. Then boradcast in the newly added beam dimension.
+    # Drop the first token because it's the last token of the prompt.
+    finished_seqs = finished_seqs[:, :, 1:]
+    # right_aligned_input has shape [batch, length_prompt].
+    # We need to add a beam dimension to it.
+    right_aligned_input = jnp.broadcast_to(
+      right_aligned_input[:, None, :],
+      (batch_size, finished_seqs.shape[1], right_aligned_input.shape[-1]),
+    )
+    # Concatenate to the length dimension.
+    # Shape of finished_seqs: [batch, beams, length]
+    finished_seqs = jnp.concatenate(
+      [right_aligned_input, finished_seqs],
+      axis=-1,
+    )
+    # Now we left align the finished seqs.
+    # First flatten the beams dimension.
+    flat_finished_seqs = jnp.reshape(
+      finished_seqs, (-1, finished_seqs.shape[-1])
+    )
+
+    flat_finished_seqs = _left_align_prompts(flat_finished_seqs)
+    # Reshape back to [batch, beams, seqs]
+    left_aligned_finished_seqs = jnp.reshape(
+      flat_finished_seqs, finished_seqs.shape
+    )
+    # Cut the last token off because we added it at the end.
+    finished_seqs = left_aligned_finished_seqs[:, :, : max_decode_len - 1]
+  else:
+    # Just drop the first dummy 0 token.
+    finished_seqs = finished_seqs[:, :, 1:]
+  
+  return finished_seqs, finished_scores
