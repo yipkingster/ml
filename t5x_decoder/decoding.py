@@ -23,7 +23,7 @@ from jax import lax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
-import binary_search
+from t5x import binary_search
 
 PyTree = Any
 PyTreeDef = jax.tree_util.PyTreeDef
@@ -739,14 +739,9 @@ def brevity_penalty(alpha: float, length: int) -> jnp.ndarray:
 def cache_map(fn, cache, apply_to_index: bool = False):
   """Maps function over that caches, even multiple caches in various layers.
 
-  Initial Leaf Shape: [2, 4, 8, 512, 64] (Batch=2, Beam=4, Heads=8, Len=512, Dim=64)
-  Flattened Leaf Shape: [8, 8, 512, 64] (Total Beams=8, Heads=8, Len=512, Dim=64)
-
   Args:
     fn: The function to apply.
-    cache: The cache to apply it to. It is a PyTree, a complex
-      dictionary/structure containing many nested tensors for every layer's Key
-      and Value heads.
+    cache: The cache to apply it to.
     apply_to_index: Whether to apply the function to the cache index.
 
   Returns:
@@ -1015,14 +1010,15 @@ class BeamState:
   finished_scores: jax.Array  # float32: [batch_size, beam_size]
   # The current active-beam-searching and finished sequences.
   live_seqs: jax.Array  # int32: [batch_size, beam_size, max_decode_len]
-  finished_seqs: jax.Array  # int32: [batch_size, beam_size, max_decode_len]
+  finished_seqs: jax.Array  # int32: [batch_size, beam_size,
+  #                                         max_decode_len]
   # Records which of the 'finished_seqs' is occupied and not a filler slot.
   finished_flags: jax.Array  # bool: [batch_size, beam_size]
   # The current state of the autoregressive decoding caches.
   cache: PyTree  # Any pytree of arrays, e.g. flax attention Cache object
   # Optional array of initial indices from which decoding starts, will be either
   # 0s if there is no prompt or None.
-  initial_index: Optional[jax.Array]
+  initial_index: jax.Array | None
 
 
 def beam_init(
@@ -1035,13 +1031,8 @@ def beam_init(
     initial_index: Optional[jnp.ndarray] = None,
 ) -> BeamState:
   """Initializes the beam search state data structure."""
-  # The 0-dimensional array with value 0. This allows easier access and 
-  # compatible broadcast.
   cur_index0 = jnp.array(0)
   live_logprobs0 = jnp.tile(
-      # Python list math: [NEG_INF] * n becomes n elements of NEG_INF.
-      # [0.0] + [NEG_INF, NEG_INF, ...] is concatenation and becomes
-      # [0.0, NEG_INF, NEG_INF, ...]
       jnp.array([0.0] + [NEG_INF] * (beam_size - 1)), [batch_size, 1]
   )
   finished_scores0 = jnp.ones((batch_size, beam_size)) * NEG_INF
@@ -1054,7 +1045,6 @@ def beam_init(
       else jnp.zeros((batch_size, beam_size, max_decode_len), jnp.int32)
   )
   finished_seqs0 = jnp.zeros((batch_size, beam_size, max_decode_len), jnp.int32)
-  # Marks which beam search has finished.
   finished_flags0 = jnp.zeros((batch_size, beam_size), jnp.bool_)
   # add beam dimension to attention cache pytree elements
   # We will have to expand the cache_index if we're given an initial prompt that
@@ -1153,6 +1143,8 @@ def beam_search(
     decode_rng: Optional[jnp.ndarray] = None,
     cache_offset: int = 0,
     initial_index: Optional[jnp.ndarray] = None,
+    num_beam_grps: int = 1,
+    diversity_strength: float = 0.5,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Beam search for transformer machine translation.
 
@@ -1199,6 +1191,10 @@ def beam_search(
       autoregressively (so it will be slow). When set, this also assumes that
       the cache is appropriately populated. Since inputs are padded on the left
       with BOS = 0, these are also the lengths of the prompts.
+    num_beam_grps: int: number of beam groups. If set to > 1, diverse beam
+      search is performed.
+    diversity_strength: float: diversity strength. Only used when num_beam_grps
+      > 1.
 
   Returns:
      Tuple of:
@@ -1309,6 +1305,94 @@ def beam_search(
         & (~exceed_max_decode_step)
     )
 
+  def update_logprobs_with_prev_group(
+    logprobs: jnp.ndarray,
+    prev_token_ids: jnp.ndarray,
+    vocab_size: int,
+    diversity_strength: float,
+  ) -> jnp.ndarray:
+    """Update logprobs with previous group."""
+    # Shape of logprobs: [batch, beam_group_size, vocab_size]
+    # Shape of prev_token_ids: [batch, 2*K1]
+    # Shape of occurences_one_hot: [batch, 2*K1, vocab_size]
+    # Create one hot from tokens chosen from previous groups.
+    occurences_one_hot = jax.nn.one_hot(prev_token_ids, vocab_size)
+    # Sum the one hot vectors to get the frequency of each token.
+    # Shape of token_frequency: [batch, vocab_size]
+    token_frequency = jnp.sum(occurences_one_hot, axis=1)
+    # Update logprobs for each vocab by subtracting the penalty.
+    logprobs -= diversity_strength * jnp.expand_dims(token_frequency, axis=1)
+    return logprobs
+
+  def flatten_group(logprobs: jnp.ndarray) -> jnp.ndarray:
+    """Flatten the group logprobs."""
+    # Shape of logprobs: [batch, beam_group_size, vocab_size]
+    # Shape of flattened logprobs: [batch, beam_group_size * vocab_size]
+    return logprobs.reshape((logprobs.shape[0], -1))
+
+  def diverse_beam_search_top_k(
+    logprobs: jnp.ndarray,
+    beams_to_keep: int,
+    diversity_strength: float,
+    num_beam_grps: int,
+  ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Diverse beam search top-k.
+
+    Args:
+      logprobs: [batch, beam, vocab_size]
+      beams_to_keep: number of beams to keep, usually 2 * beam_size
+      diversity_strength: diversity strength.
+      num_beam_grps: number of beam groups
+    """
+    # Explicitly check that beams_to_keep is divisible by num_beam_grps.
+    # This will avoid corner case where less than 2K beams are returned.
+    if num_beam_grps > 1 and beams_to_keep % num_beam_grps != 0:
+      raise ValueError(
+          f"beams_to_keep ({beams_to_keep}) must be divisible by "
+          f"num_beam_grps ({num_beam_grps}) for Diverse Beam Search."
+      )
+
+    # Shape of logprobs: [batch, beam, vocab_size]
+    # divide the input into groups
+    vocab_size = logprobs.shape[-1]
+    # Type of groups: list of [batch, group_size, vocab_size]
+    groups = jnp.array_split(logprobs, num_beam_grps, axis=1)
+    beam_group_size = beams_to_keep // num_beam_grps
+    # Run top_k for the first group
+    # Gather the top 2*K1 scores from _all_ beams, K1 = K/num_beam_grps
+    # --> [batch, 2*K1], [batch, 2*K1]
+    cur_topk_log_probs, cur_topk_indices = top_k_two_stage(
+        flatten_group(groups[0]), k=beam_group_size
+    )
+    # Get the actual token ids
+    cur_token_ids = cur_topk_indices % vocab_size
+    group_offset = groups[0].shape[1] * vocab_size
+    for i in range(1, num_beam_grps):
+      # Get the new group logprobs via the current top-k logprobs
+      new_group_logprobs = update_logprobs_with_prev_group(
+        groups[i],
+        cur_token_ids,
+        vocab_size,
+        diversity_strength,
+      )
+      # Get top-k logprobs of the new group
+      new_topk_log_probs, new_topk_indices = top_k_two_stage(
+        flatten_group(new_group_logprobs), k=beam_group_size
+      )
+      
+      # Merge with the current logprobs
+      cur_topk_log_probs = jnp.concatenate(
+        [cur_topk_log_probs, new_topk_log_probs], axis=-1
+      )
+      new_topk_indices += group_offset
+      group_offset += groups[i].shape[1] * vocab_size
+      cur_topk_indices = jnp.concatenate(
+        [cur_topk_indices, new_topk_indices], axis=-1
+      )
+      cur_token_ids = cur_topk_indices % vocab_size
+    
+    return cur_topk_log_probs, cur_topk_indices
+
   def beam_search_loop_body_fn(state: BeamState) -> BeamState:
     """Beam search loop state update function."""
     # Collect the current position slice along length to feed the fast
@@ -1365,11 +1449,23 @@ def beam_search(
     beams_to_keep = 2 * beam_size
     # Flatten beam and vocab dimensions.
     flat_log_probs = log_probs.reshape((batch_size, beam_size * vocab_size))
-    # Gather the top 2*K scores from _all_ beams.
-    # --> [batch, 2*beams], [batch, 2*beams]
-    topk_log_probs, topk_indices = top_k_two_stage(
-        flat_log_probs, k=beams_to_keep
-    )
+    if num_beam_grps == 1:
+      # This is traditional beam search.
+      # Gather the top 2*K scores from _all_ beams.
+      # --> [batch, 2*beams], [batch, 2*beams]
+      topk_log_probs, topk_indices = top_k_two_stage(
+          flat_log_probs, k=beams_to_keep
+      )
+    else:
+      # This is diverse beam search.
+      topk_log_probs, topk_indices = diverse_beam_search_top_k(
+          # Note DBS doesn't use flattened logprobs, it needs to divide the
+          # beams into groups
+          log_probs,
+          beams_to_keep,
+          diversity_strength,
+          num_beam_grps,
+      )
 
     # Append the most probable 2*K token IDs to the top 2*K sequences
     # Recover token id by modulo division.
@@ -1576,533 +1672,4 @@ def beam_search(
     # Just drop the first dummy 0 token.
     finished_seqs = finished_seqs[:, :, 1:]
 
-  return finished_seqs, finished_scores
-
-def diversed_beam_search(
-    inputs: jnp.ndarray,
-    cache: Mapping[str, jnp.ndarray],
-    tokens_to_logits: Callable[
-        [DecodingState], Tuple[jnp.ndarray, Mapping[str, jnp.ndarray]]
-    ],
-    eos_id: int,
-    num_decodes: int = 4,
-    alpha: float = 0.6,
-    diversity_strength: float = 0.5,
-    num_beam_grps: int = 1,
-    max_decode_len: Optional[int] = None,
-    max_decode_step: int = -1,
-    min_log_prob: float = NEG_INF_VALUE,
-    cache_offset: int = 0,
-    initial_index: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-  """
-  Diverse beam search implementation. See https://arxiv.org/abs/1610.02424
-
-  Args:
-    inputs: array: [batch_size, length] int32 sequence of tokens.
-      e.g. If the prompt is "Translate: Hello" and the tokens are [350, 4200],
-      then:
-      input = jnp.array([0, 350, 4200, 0, 0, 0, 0, 0])
-      0: dummpy/BOS token
-      350: 'Translate'
-      4200: 'Hello'
-      0, 0, 0, 0, 0: Where the decoder will write the answer.
-    cache: flax attention cache. aka KV cache.
-    tokens_to_logits: fast autoregressive decoder function taking single token
-      slices and cache and returning next-token logits and updated cache.
-    eos_id: int: id of end-of-sentence token for target vocabulary.
-    num_decodes: number of decoded sequences to be returned. This is equivalent
-      to the number of beams used in the beam search.
-    alpha: float: scaling factor for brevity penalty.
-    diversity_strength: float: strength of diversity penalty. The stronger, the 
-      more penalty for lack of diversity. According to the original paper, the
-      value is between 0.2 to 0.8.
-    num_beam_grps: int: number of beam groups. The beam search will be performed
-      in `num_beam_grps` groups, and the top `num_decodes // num_beam_grps`
-      beams will be selected from each group, so the total bean number is still
-      num_decodes. Note that if num_beam_grps <= 1, it will be set to 1. If the
-      num_beam_grps > num_decodes, it will be set to num_decodes.
-    max_decode_len: int: an optional maximum length of decoded sequence. If
-      None, it uses `inputs.shape[1]` as `max_decode_len`. This value ultimately
-      depends on the task, e.g. 256 for summarisation, 2 * input for translation.
-    max_decode_step: int: maximum number of extra beam search steps allowed.
-      While using initial_index with prompts of variable lengths, max_decode_len
-      controls the output length, min_log_prob only stops the beam search if all
-      beam entries fail to pass the threshold, this will set a hard limit of
-      number of beam search steps to run. Useful to set a hard limit for the
-      serving latency.
-    min_log_prob: the beam search will stop if there is no live beam entry with
-      higher raw score (ignoring brevity penalty) than this.
-    cache_offset: axis offset for cache, arising from scanned layers.
-    initial_index: Optional[jnp.ndarray], the index from which to start decoding
-      autoregressively if set. If unset, then we teacher-force the prefix, but
-      autoregressively (so it will be slow). When set, this also assumes that
-      the cache is appropriately populated. Since inputs are padded on the left
-      with BOS = 0, these are also the lengths of the prompts.
-
-  Returns:
-     Tuple of:
-       [batch_size, beam_size, max_decode_len] top-scoring sequences
-       [batch_size, beam_size] beam-search scores.
-  """
-  batch_size = inputs.shape[0]
-  beam_size = num_decodes
-  if num_beam_grps <= 1:
-    num_beam_grps = 1
-  elif num_beam_grps > beam_size:
-    num_beam_grps = beam_size
-  beam_group_size = beam_size // num_beam_grps
-  # This is a scalar array of the end marker token id. For boardcasting purposes.
-  # Note that the scalar array has shape of () - empty tuple. and jnp.isscalar()
-  # returns True.
-  end_marker = jnp.array(eos_id)
-
-  if max_decode_len is None:
-    max_decode_len = inputs.shape[1]
-  # If the max_decode_len is set to bigger than the input length, we need to
-  # pad the input with BOS tokens to the max_decode_len.
-  if max_decode_len > inputs.shape[1]:
-    padding_length = max_decode_len - inputs.shape[1]
-    padding = jnp.zeros((batch_size, padding_length), dtype=jnp.int32)
-    inputs = jnp.concatenate([padding, inputs], axis=-1)
-  # We need to add 1 to the max_decode_len because we add 1 dummy token at the
-  # beginning of the sequence.
-  max_decode_len += 1
-  
-  right_aligned_input = None
-  live_seqs = None
-  if initial_index is not None:
-    # This means the prompt has already been read and the decoder will just
-    # start predicting the answer.
-    # TODO: Exercise both right align algorithms.
-    right_aligned_input = _right_align_prompts(inputs)
-    length = inputs.shape[1]
-    # right_aligned_input[:, -1] take all rows from the first dimension, and
-    # then takes only the last column from the second dimension (last token of
-    # the prompt).
-    # [0, None] adds a new dimension.
-    inputs = jnp.pad(right_aligned_input[:, -1][:, None],
-                     # (0, 0) adds no padding to the first dimension.
-                     # (0, length - 1) adds (length - 1) padding to the second
-                     # dimension. Note that we already have the first token of
-                     # the prompt, so we only need to add (length - 1) padding.
-                     # This makes total size of "length" because we need a EOS
-                     # token at the end.
-                     ((0, 0), (0, length - 1)),
-                     constant_values=0)
-    
-    live_seqs = jnp.pad(right_aligned_input[:, -1][:, None],
-                        ((0, 0), (0, max_decode_len-1)),
-                        constant_values=0)
-    
-    
-    live_seqs = jnp.expand_dims(live_seqs, axis=1)
-    live_seqs = jnp.broadcast_to(
-        # We want to explore on every beam group, which at sthis point is just
-        # the same as the beam size.
-        live_seqs, (live_seqs.shape[0], beam_group_size, live_seqs.shape[-1])
-    )
-  else:
-    initial_index = jnp.zeros((batch_size,), dtype=jnp.int32)
-
-  # initialize diverse beam search state
-  beam_search_init_state = beam_init(
-      batch_size,
-      beam_size,
-      max_decode_len,
-      cache,
-      cache_offset,
-      live_seqs=live_seqs,
-      initial_index=initial_index,
-  )
-
-  def beam_search_loop_cond_fn(state: BeamState) -> jax.array:
-    """Beam search loop continuation condition."""
-    # Have we reached max decoding length?
-    # Since we might be starting at different points in the prompts, let's use
-    # the minimum prompt length to stop conservatively.
-    #
-    # This is a counter that count "steps" so far, since different batches have
-    # different length, we took the minimum length so the longest path will be
-    # satisfied when we compare this counter to max_decode_len.
-    cur_index = state.cur_index + jnp.min(state.initial_index)
-    # Because we mutate the "i+1" position, we stop one token before the end.
-    # cur_index is the position we "look back at" to generate at cur_index + 1.
-    not_at_end = cur_index < max_decode_len - 1
-    exceed_max_decode_step = max_decode_step > 0 and jnp.all(
-      state.cur_index >= max_decode_step
-    )
-
-    # Here the max_decode_len is used because we only use it to calucate if we
-    # want to terminate the search early. So we use the "optimistic" penalty.
-    # If with this optimistic panelty a beam search still can't beat a finished
-    # sequence, then it's not worth continuing the search.
-    min_brevity_penalty = brevity_penalty(state.alpha, max_decode_len)
-    # Normalize the live scores by dividing the min_brevity_penalty. This is to 
-    # measure the "average goodness" of every word. 
-    # We don't divide by the simple length because brevity penalty is the
-    # mathematically best balance to avoid swinging to reward infinitely long
-    # sequences.
-    best_live_scores = state.live_logprobs[:, -1:] / min_brevity_penalty
-    # Get the worst finished scores:
-    worst_finished_score =jnp.min(
-      state.finished_scores, axis=1, keepdims=True
-    )
-
-    # If a beam is not finished, set the slots to -inf.
-    # Technically this is redundant because the finished_scores are initialized
-    # to -inf.
-    worst_finished_score = jnp.where(
-      state.finished_flags, worst_finished_score, NEG_INF
-    )
-
-    # If the best live score is already worse than the worst finished score,
-    # then we can terminate the search.
-    search_terminated = jnp.all(best_live_scores < worst_finished_score)
-
-    # If all the best live scores are worse than the minimum acceptable score,
-    # then we can terminate the search. 
-    # This could happen if min_log_prob is set to bigger than NEG_INF when we
-    # want to save compute resources when the end result is hopeless to finish.
-    min_scores = min_log_prob / min_brevity_penalty
-    all_min_scores_test_failed = jnp.all(
-      # Please note we use bitwise "&" because JIT compiler overload it to allow
-      # JAX arrays and tracers to be evaulated at the runtime in TPU/GPU. If we
-      # use "and", it will crash because the values are unknown at compile time.
-      # Also note that "&" doesn't shortcircuit so both parts are evaulated.
-      # This is why we need to check state.cur_index > 0.
-      (min_scores < worst_finished_score) & (state.cur_index > 0)
-    )
-    
-    # Loop will continue if returning true.
-    return (
-      not_at_end
-      & (~exceed_max_decode_step)
-      & (~search_terminated) 
-      & (~all_min_scores_test_failed)
-    )
-
-  def update_logprobs_with_prev_group(
-    logprobs: jnp.ndarray,
-    prev_token_ids: jnp.ndarray,
-    diversity_strength: float,
-  ) -> jnp.ndarray:
-    """Update logprobs with previous group."""
-    # Shape of logprobs: [batch, beam_group_size, vocab_size]
-    # Shape of prev_token_ids: [batch, previous_groups_total_size]
-    # Shape of occurences_one_hot: [batch, previous_groups_total_size, vocab_size]
-    # Create one hot from tokens chosen from previous groups.
-    occurences_one_hot = jax.nn.one_hot(prev_token_ids, vocab_size)
-    # Sum the one hot vectors to get the frequency of each token.
-    token_frequency = jnp.sum(occurences_one_hot, axis=1)
-    # Update logprobs for each vocab by subtracting the penalty.
-    logprobs -= diversity_strength * jnp.expand_dims(token_frequency, axis=1)
-    return logprobs
-
-  def diverse_beam_search_top_k(
-    logprobs: jnp.ndarray,
-    beams_to_keep: int,
-    beam_size: int,
-    diversity_strength: float,
-    num_beam_grps: int,
-  ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Diverse beam search top-k.
-
-    Args:
-      logprobs: [batch, beam, vocab_size]
-      beams_to_keep: number of beams to keep, usually 2 * beam_size
-      beam_size: number of beams
-      diversity_strength: diversity strength.
-      num_beam_grps: number of beam groups
-    """
-    # Shape of logprobs: [batch, beam, vocab_size]
-    # divide the input into groups
-    # Type of groups: list of [batch, group_size, vocab_size]
-    groups = jnp.array_split(logprobs, num_beam_grps, axis=1)
-    beam_group_size = beam_size // num_beam_grps
-    # Run top_k for the first group
-    # Gather the top 2*K1 scores from _all_ beams, K1 = K/num_beam_grps
-    # --> [batch, 2*K1], [batch, 2*K1]
-    cur_topk_log_probs, cur_topk_indices = top_k_two_stage(
-        groups[0], k=beam_group_size
-    )
-    # Get the actual token ids
-    cur_token_ids = cur_topk_indices % vocab_size
-
-    for i in range(1, num_beam_grps):
-      # Get the new group logprobs via the current top-k logprobs
-      # TODO: Build the penalty function.
-      new_group_logprobs = update_logprobs_with_prev_group(
-        groups[i],
-        cur_token_ids,
-        diversity_strength,
-      )
-      # Get top-k logprobs of the new group
-      new_topk_log_probs, new_topk_indices = top_k_two_stage(
-        new_group_logprobs, k=beam_group_size
-      )
-      # Merge with the current logprobs
-      cur_topk_log_probs = jnp.concatenate(
-        [cur_topk_log_probs, new_topk_log_probs], axis=-1
-      )
-      cur_topk_indices = jnp.concatenate(
-        [cur_topk_indices, new_topk_indices], axis=-1
-      )
-      cur_token_ids = cur_topk_indices % vocab_size
-    
-    return cur_topk_log_probs, cur_topk_indices
-
-    # Out of the loop: cur_topk_log_probs is the one to continue with.
-    
-  def beam_search_loop_body_fn(state: BeamState) -> BeamState:
-    """Beam search loop body function."""
-    flat_cur_tokens = lax.dynamic_slice(
-      # Source array [batch, beam, seq_len]
-      state.live_seqs,
-      # Start index [batch, beam, seq]
-      (0, 0, state.cur_index),
-      # Slice size [batch, beam, 1]
-      (batch_size, beam_size, 1)
-    )
-
-    # TODO: Exercise flatten_beam_dim function
-    # This flatten the cache PyTree before feeding into the model.
-    flat_cache = cache_map(
-        functools.partial(flatten_beam_dim, offset=cache_offset), state.cache
-    )
-
-    decoding_state = DecodingState(
-      cur_index = state.cur_index,
-      sequences = flatten_beam_dim(state.live_seqs),
-      cur_tokens = flat_cur_tokens,
-      cache = flat_cache,
-    )
-
-    flat_logits, new_flat_cache = tokens_to_logits(decoding_state)
-    
-    logits = unflatten_beam_dim(flat_logits, batch_size, beam_size)
-
-    new_cache = cache_map(
-      lambda x: unflatten_beam_dim(x, batch_size, beam_size, offset=cache_offset),
-      new_flat_cache
-    )
-
-    candidate_logprobs = jnp.log_softmax(logits, axis=-1)
-    # state.live_logprobs shape: [batch, beam]
-    # candidate_logprobs shape: [batch, beam, vocab_size]
-    # We need to add them together, so we need to expand the dimensions of
-    # state.live_logprobs to [batch, beam, 1]
-    logprobs = candidate_logprobs + jnp.expand_dims(state.live_logprobs, axis=2)
-
-    # TODO: Now DBS: We will have G groups and each group has B/G candidates.
-    # For G1: Usual beam search
-    # For G2: Add diversity penalty to the new token that G1 picked. Pick B/G
-    # best candidates from G2.
-    # For G3: Add diversity penalty to the new token that G1 and G2 picked. Pick
-    # B/G best candidates from G3.
-    # ...
-    # Now the total number of candidates is still B since we picked B/G from G
-    # groups.
-    # TODO: Understand Math symbols in the original paper using Gemini.
-    
-    vocab_size = logprobs.shape[-1]
-
-    flattened_logprobs = logprobs.reshape((batch_size, beam_size * vocab_size))
-    beams_to_keep = 2 * beam_size
-    top_k_logprobs, top_k_indices = diverse_beam_search_top_k(
-      flattened_logprobs,
-      beams_to_keep,
-      beam_size,
-      diversity_strength,
-      num_beam_grps,
-    )
-
-    # At this point, top_k_indices is still flattened. Here we get the
-    # top_k_tokens by doing mod. Later, we will do ceiling division to get the 
-    # beam groups.
-    top_k_tokens = top_k_indices % vocab_size
-    # Get the next input token from the original input.
-    # Shape of input: [batch, seq_len]
-    # Shape of next_input_token: [batch, 1]
-    next_input_token = jnp.expand_dims(input, axis=1).astype(jnp.int32)[
-      :, :, state.cur_index + 1
-    ]
-    # Check if the next input token is the padding token (0). If so, we are out
-    # of the prompt and can stop teacher forcing.
-    # Shape of out_of_prompt: [batch, 1]
-    out_of_prompt = next_input_token == 0
-
-    # Set of the first beam logprob to 0 and rest of them to -INF so only one
-    # beam is alive during teacher forcing.
-    inside_prompt = jnp.concatenate(
-      [
-        jnp.zeros((batch_size, 1), dtype=top_k_logprobs.dtype),
-        jnp.full_like(top_k_logprobs[:, : beams_to_keep-1], NEG_INF),
-      ],
-      axis=1,    
-    )
-
-    top_k_logprobs = (top_k_logprobs * ~out_of_prompt + 
-                      inside_prompt * out_of_prompt)
-    topk_ids = (next_input_token * ~out_of_prompt + 
-                      topk_ids * out_of_prompt)
-
-    # Expand the dimensions of topk_ids to [batch, beams_to_keep, 1] for
-    # broadcasting.
-    topk_ids = jnp.expand_dims(topk_ids, axis=2)
-    
-    # Recovers the beam indices by doing ceiling division.
-    topk_beam_indices = top_k_indices // vocab_size
-
-    topk_seqs = gather_beams(
-      state.live_seqs,
-      topk_beam_indices,
-      batch_size,
-      beam_size,
-      beams_to_keep,
-    )
-
-    # Update top K seqes by adding the new tokens.
-    # Shape of topk_seqs: [batch, beams_to_keep, seq_len]
-    # Shape of topk_ids: [batch, beams_to_keep, 1]
-    topk_seqs = lax.dynamic_update_slice(
-      topk_seqs,
-      topk_ids,
-      (0, 0, state.cur_index + 1),
-    )
-
-    # The following code will keep 2K active seqs
-    newly_finished = topk_seqs[:, :, state.cur_index + 1] == end_marker
-
-    # Prevent those finished seqs from being added to the live seqs.
-    # We add -INF to the logprobs of the finished seqs so they won't be
-    # selected again.
-    new_logprobs = top_k_logprobs + newly_finished * NEG_INF
-
-    _, new_topk_indices = lax.top_k(new_logprobs, k=beam_size)
-    new_topk_indices = jnp.flip(new_topk_indices, axis=1)
-
-    top_alive_seqs, top_alive_log_probs = gather_beams(
-      [topk_seqs, new_logprobs],
-      new_topk_indices,
-      batch_size,
-      beam_size,
-      beams_to_keep,
-    )
-
-    top_alive_indices = gather_beams(
-      topk_beam_indices,
-      new_topk_indices,
-      batch_size,
-      2 * beam_size,
-      beam_size,
-    )
-
-    top_alive_cache = cache_gather_beams(
-      state.cache,
-      top_alive_indices,
-      batch_size,
-      beam_size,
-      beam_size,
-      True,
-      offset=cache_offset,
-    )
-
-    # The following code will store the finished sequences.
-    finished_seqs = jnp.concatenate(
-      [state.finished_seqs, topk_seqs],
-      axis=1,
-    )
-    finished_scores = jnp.concatenate(
-      [state.finished_scores, new_scores],
-      axis=1,
-    )
-    finished_flags = jnp.concatenate(
-      [state.finished_flags, newly_finished],
-      axis=1,
-    )
-
-    top_finished_seq, top_finished_scores, top_finished_flags = (
-      gather_topk_beams(
-        [finished_seqs, finished_scores, finished_flags],
-        finished_scores,
-        batch_size,
-        beam_size,
-      )
-    )
-
-    return BeamState(
-        cur_index=state.cur_index + 1,
-        live_logprobs=top_alive_log_probs,
-        finished_scores=top_finished_scores,
-        live_seqs=top_alive_seqs,
-        finished_seqs=top_finished_seq,
-        finished_flags=top_finished_flags,
-        cache=top_alive_cache,
-        initial_index=initial_index,
-    )
-
-  final_state = lax.while_loop(
-    beam_search_loop_cond_fn,
-    beam_search_loop_body_fn,
-    initial_state,
-  )
-
-  any_finished = jnp.any(final_state.finished_flags, axis=1)
-  # --> [batch, beams, seqs]
-  finished_seqs = jnp.where(
-    any_finished[:, None, None],
-    final_state.finished_seqs,
-    final_state.live_seqs,
-  )
-
-  # --> [batch, beams]
-  finished_scores = jnp.where(
-    any_finished[:, None],
-    final_state.finished_scores,
-    final_state.live_logprobs,
-  )
-
-  finished_flags = jnp.where(
-    any_finished[:, None],
-    final_state.finished_flags,
-    jnp.ones_like(final_state.finished_flags),
-  )
-
-  # Construct the output from the right aligned prompt.
-  if right_aligned_input is not None:
-    # We have the last token and finished seqs.
-    # We need to get rid of the last token and add the finished seqs and remove
-    # the paddings. Then boradcast in the newly added beam dimension.
-    # Drop the first token because it's the last token of the prompt.
-    finished_seqs = finished_seqs[:, :, 1:]
-    # right_aligned_input has shape [batch, length_prompt].
-    # We need to add a beam dimension to it.
-    right_aligned_input = jnp.broadcast_to(
-      right_aligned_input[:, None, :],
-      (batch_size, finished_seqs.shape[1], right_aligned_input.shape[-1]),
-    )
-    # Concatenate to the length dimension.
-    # Shape of finished_seqs: [batch, beams, length]
-    finished_seqs = jnp.concatenate(
-      [right_aligned_input, finished_seqs],
-      axis=-1,
-    )
-    # Now we left align the finished seqs.
-    # First flatten the beams dimension.
-    flat_finished_seqs = jnp.reshape(
-      finished_seqs, (-1, finished_seqs.shape[-1])
-    )
-
-    flat_finished_seqs = _left_align_prompts(flat_finished_seqs)
-    # Reshape back to [batch, beams, seqs]
-    left_aligned_finished_seqs = jnp.reshape(
-      flat_finished_seqs, finished_seqs.shape
-    )
-    # Cut the last token off because we added it at the end.
-    finished_seqs = left_aligned_finished_seqs[:, :, : max_decode_len - 1]
-  else:
-    # Just drop the first dummy 0 token.
-    finished_seqs = finished_seqs[:, :, 1:]
-  
   return finished_seqs, finished_scores
