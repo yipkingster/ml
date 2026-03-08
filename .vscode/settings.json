@@ -1,0 +1,5 @@
+{
+    "kaggle.cliPath": "/Library/Frameworks/Python.framework/Versions/3.13/bin/kaggle",
+    "kaggle.defaultInternet": true,
+    "kaggle.defaultAccelerator": "gpu"
+}
