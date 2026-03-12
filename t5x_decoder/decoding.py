@@ -750,6 +750,9 @@ def cache_map(fn, cache, apply_to_index: bool = False):
   frozen = isinstance(cache, flax.core.FrozenDict)
   if frozen:
     cache = flax.core.unfreeze(cache)
+  # Flatten nested keys into a single level.
+  # This "flattening" is working on the keys, while the later applied fn
+  # (flatten_beam_dim) is working on the values (merge the first 2 dims).
   flat_cache = traverse_util.flatten_dict(cache)
   if apply_to_index:
     keyvals = flat_cache
@@ -761,9 +764,11 @@ def cache_map(fn, cache, apply_to_index: bool = False):
   #   map over, instead of doing this ad-hoc.
   exclusion_list = ['cached_bias', 'position_embedder_index']
   keyvals = {k: v for k, v in keyvals.items() if k[-1] not in exclusion_list}
-
+  # Apply the function (flatten_beam_dim) to the cache values. Note that the
+  # function just merge the batch and beam dimensions.
   keyvals = jax.tree.map(fn, keyvals)
   flat_cache.update(keyvals)
+  # Unflatten the cache. Restore the original nested keys.
   new_cache = traverse_util.unflatten_dict(flat_cache)
   if frozen:
     new_cache = flax.core.freeze(new_cache)
@@ -782,8 +787,15 @@ def add_beam_dim(
 
 def flatten_beam_dim(x: jnp.ndarray, offset: int = 0) -> jnp.ndarray:
   """Flattens the first two dimensions of a non-scalar array."""
+  # x.shape is a tuple, unmutable.
+  # list is mutable.
+  # e.g. xshape = [2, 3, 4]
   xshape = list(x.shape)
+  # Pop and return the element at index offset.
+  # xshape becomes [3, 4], b_sz (batch size) = 2.
   b_sz = xshape.pop(offset)
+  # xshape[offset] *= b_sz; xshape[0] = 2 * 3 = 6.
+  # xshape becomes [6, 4].
   xshape[offset] *= b_sz
   return x.reshape(xshape)
 
@@ -1400,13 +1412,31 @@ def beam_search(
     # dimension for feeding into the model.
     # --> [batch * beam, 1]
     flat_ids = flatten_beam_dim(
+        # lax.dynamic_slice: (operand, start_indices, slice_sizes) where
+        #   operand is the array to slice from,
+        #   start_indices is the starting index of the slice, length equals to
+        #     the rank of operand,
+        #   slice_sizes is the size of the slice, length equals to the rank of
+        #     operand. If the size + start_index is out of bounds, the start_index
+        #     will be adjusted towards the beginning of the operand.
+        # The whole dynamic_slice statement takes every batch, every beam, and
+        # the 1st element of the current index - the current token to feed into
+        # the model.
         lax.dynamic_slice(
+            # live_seqs: int32 [batch_size, beam_size, max_decode_len]
+            # cur_index: int32 scalar
+            # batch_size: int32 scalar
+            # beam_size: int32 scalar
             state.live_seqs, (0, 0, state.cur_index), (batch_size, beam_size, 1)
         )
     )
     # Flatten beam dimension into batch to be compatible with model.
     # {[batch, beam, ...], ...} --> {[batch * beam, ...], ...}
     flat_cache = cache_map(
+        # functools.partial: create a new function with some arguments
+        # pre-filled - in this case, the offset variable.
+        # cache_offset is for scan mode where jax.lax.scan is used to
+        # optimize the decoding loop for multiple layers.
         functools.partial(flatten_beam_dim, offset=cache_offset), state.cache
     )
 
