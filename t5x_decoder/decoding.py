@@ -806,6 +806,11 @@ def unflatten_beam_dim(
   """Unflattens the first, flat batch*beam dimension of a non-scalar array."""
   assert batch_size * beam_size == x.shape[offset]
   xshape = list(x.shape)
+  # Python list "+" creates a new list with operands concatenated.
+  # The new shape has 3 parts:
+  # 1. Anything up to offset stays untouched.
+  # 2. batch_size and beam_size
+  # 3. Anything after the offset+1, i.e. anything after batch*beams dim.
   newshape = xshape[:offset] + [batch_size, beam_size] + xshape[offset + 1 :]
   return x.reshape(newshape)
 
@@ -893,11 +898,14 @@ def gather_beams(
   """Gathers the beam slices indexed by beam_indices into new beam array.
 
   Args:
-    nested: pytree of arrays or scalars (the latter ignored).
-    beam_indices: array of beam_indices
+    nested: pytree of arrays or scalars (the latter ignored). 
+        e.g. state.live_seqs: [batch, beam, seq_len]
+    beam_indices: array of beam_indices, [batch, 2*beams]
     batch_size: size of batch.
     old_beam_size: size of _old_ beam dimension.
+        e.g original beam size.
     new_beam_size: size of _new_ beam dimension.
+        e.g. beams_to_keep.
     one_hot: whether to perform gathers by one-hot contraction or directly.
 
   Returns:
@@ -907,12 +915,37 @@ def gather_beams(
   if one_hot:
     # Gather via one-hot contraction, needed for SPMD partitioning.
     oh_beam_indices = jax.nn.one_hot(
+        # beam_indices: [batch, 2*beams]
+        # old_beam_size: original beam size
         beam_indices, old_beam_size, dtype=jnp.int32
     )
 
     def gather_fn(x):
+      # einsum is tensor contraction operation, a generic operation for matrix
+      # multiplication. In tensor contraction, 1 or more dimensions can be
+      # summed away in "dot product", just like 1 dimension will be summed away
+      # in matmul. The rules are:
+      #
+      # 1. If a dimension shows on input 1, input 2 and the output, that's the batch
+      # dimension. "b" is it in this case.
+      # 2. If a dimension shows in both inputs, but not in the output,
+      # that is "sum over" dimension, a.k.a contraction.
+      # 3. If a dimension shows in one input and in output, that's remaining dimension
+      # e.g. "e" in this case.
+      # 4. Ellipsis "..." means "collect all", it doesn't mean "skip". It means
+      # apply the same rules in multiplication. The values are multiplied only
+      # when the indices for the ... dimensions match exactly.
+      # So the following subscript basically does matrix multiplication:
+      # "eo x o = e", with b as batch.
+      # in this case, let's say batch=2, e=2*beams, o=old_beam_size, the output
+      # will be (batch x 2*beams)
       return jnp.einsum('beo,bo...->be...', oh_beam_indices, x).astype(x.dtype)
 
+    # jax.tree.map applies the gather_fn function to each leaf of a pytree.
+    # In this case, it applies gather_fn to each array in the state.live_seqs,
+    # which has the shape [batch, beam, length].
+    # Note that the leaf means any value (ndarray) that is contained in either
+    # a list, tuple, or dict.
     return jax.tree.map(gather_fn, nested)
   else:
     # True gather via fancy indexing.
@@ -1461,9 +1494,16 @@ def beam_search(
     )
 
     # Gather log probabilities from logits
+    # softmax turns raw logits into probability after exp(x).
+    # exp(x) keeps the value positive and magnifide the differences.
+    # It also has derivative equal to itself and make cross entropy loss convex.
     candidate_log_probs = jax.nn.log_softmax(logits)
     # Add new logprobs to existing prefix logprobs.
     # --> [batch, beam, vocab]
+    # state.live_logprobs: [batch, beams], each value represents the accumulative
+    # logprobs for that beam.
+    # Jax uses broadcast in addition when add [batch, beam, 1] tensor to 
+    # [batch, beam, vocab] tensor.
     log_probs = candidate_log_probs + jnp.expand_dims(
         state.live_logprobs, axis=2
     )
@@ -1507,6 +1547,28 @@ def beam_search(
     # inputs so that at position 1 onwards (i.e. state.cur_index + 1 >= 1)
     # the tokens are 0 and we'll immediately be "out of prompt".
     # --> [batch_size, 1]
+    # input: [batch_size, length]
+    # next_input_token: [batch, 1]
+    # This is because when slice representation is a scalar, like in this case
+    # state.cur_index + 1, Jax/Numpy collapses that dimension.
+    # e.g. When input is a shape of (2,2,3):
+    # X = [
+    #   Batch Index 0
+    #   [ 
+    #     [0, 1, 2], # Beam Index 0
+    #     [3, 4, 5]  # Beam Index 1
+    #   ], 
+    #   # Batch Index 1
+    #   [ 
+    #     [6, 7, 8],  # Beam Index 0
+    #     [9, 10, 11] # Beam Index 1
+    #   ]
+    # ]
+    # The slice [:,:,0] will be:
+    # [
+    #   [0, 3], # Batch 0
+    #   [6, 9]. # Batch 1
+    # ]
     next_input_token = jnp.expand_dims(inputs, axis=1).astype(jnp.int32)[
         :, :, state.cur_index + 1
     ]
@@ -1520,16 +1582,22 @@ def beam_search(
     # --> [batch, 2*beams]
     inside_prompt_log_probs = jnp.concatenate(
         [
+            # The 1st beam will have 0 as logprob: 100%
             jnp.zeros((batch_size, 1), dtype=topk_log_probs.dtype),
+            # The 2nd to last beams_to_keep will have NEG_INF: 0%.
+            # Note the beams_to_keep - 1 is an exclusive stop index.
             jnp.full_like(topk_log_probs[:, : beams_to_keep - 1], NEG_INF),
         ],
         axis=1,
     )
+    # topk_log_probs: [batch, 2*beams]
+    # inside_prompt_log_probs: [batch, 2*beams]
     topk_log_probs = (
         topk_log_probs * out_of_prompt
         + inside_prompt_log_probs * ~out_of_prompt
     )
-
+    # topk_ids: [batch, 2*beams]
+    # next_input_token: [batch, 1]
     topk_ids = topk_ids * out_of_prompt + next_input_token * ~out_of_prompt
 
     # Expand id array for broadcasting
