@@ -5,6 +5,7 @@ kaggle.json
 .kaggle-run.log
 fix_nb.py
 notebook.ipynb
+.kaggle-outputs/*
 .kaggle-outputs/my_log/checkpoints/t5_1_1_base/checkpoint_1000000/checkpoint
 .kaggle-outputs/my_log/checkpoints/t5_1_1_base/checkpoint_1000000/target.decoder.layers_0.encoder_decoder_attention.key.kernel/.zarray
 .kaggle-outputs/my_log/checkpoints/t5_1_1_base/checkpoint_1000000/target.decoder.layers_0.encoder_decoder_attention.key.kernel/0.0
