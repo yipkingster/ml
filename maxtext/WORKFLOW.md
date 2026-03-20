@@ -201,3 +201,29 @@ git push origin fix-config-and-case
 ```
 
 **Summary:** Working on branches makes you a much more organized contributor and prevents your [main](cci:1://file:///Users/kevinwang/Projects/maxtext/src/MaxText/inference/decode.py:86:0-230:21) branch from getting "polluted" with custom code that makes updates difficult.
+
+# Why does the branch name has "/": feature/diverse-beam-search
+
+The slash (`/`) in `feature/diverse-beam-search` is a **naming convention** used to organize branches into virtual "folders". 
+
+Here's why developers use it:
+
+### 1. Grouping and Organization
+When you have a project with lots of contributors, using prefixes like **`feature/`**, **`fix/`**, or **`docs/`** makes the branch list much easier to read. 
+-   **`feature/`**: New development work.
+-   **`fix/`**: Bug fixes.
+-   **`refactor/`**: Code cleaning (like our folder rename!).
+
+### 2. Visualization in Tools
+Most Git clients (like VS Code, Tower, or SourceTree) will **automatically group** branches with the same prefix into a folder in their user interface. 
+-   Instead of seeing a long, messy list, you'll see a folder icon for "feature" that you can expand to find all the separate feature branches inside.
+
+### 3. Git-Flow Standard
+This is part of a very popular workflow called **Git-Flow**. It assumes that all real work should either be in a `feature/` or `hotfix/` branch, while [main](cci:1://file:///Users/kevinwang/Projects/maxtext/src/MaxText/inference/decode.py:86:0-230:21) stays protected and clean.
+
+---
+
+### Does it actually create folders?
+**No**, Git doesn't literally create folders on your hard drive for this. It's just a string of text. You could have called it `feature-diverse-beam-search` or just `dbs`, and Git would treat it the same way.
+
+**Tip:** If you're ready to commit the naming fix we made, you could call your new branch **`fix/folder-naming-consistency`** to follow this same style!
