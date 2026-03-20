@@ -85,10 +85,22 @@ def _batch_first_result_token(first_tokens: list[Any], batch_size: int):
 
 
 def main(argv: Sequence[str]) -> None:
+  # Use unsafe (random) hardware bit generator to generate random numbers.
+  # This is faster than the default PRNG implementation.
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
 
+  # pyconfig has a hierachy and we can override values using command line flags.
+  # The example argv would look like this:
+  # [
+  #   "src/maxtext/train.py",        # argv[0] is the script name
+  #   "base.yml",                   # argv[1] is typically the base config file
+  #   "run_name=test_run",          # These are key-value overrides
+  #   "per_device_batch_size=4"
+  # ]
   config = pyconfig.initialize(argv)
+  # Validate the config. Inference doesn't need full state (training/optimizer
+  # metadata), it only needs weights. 
   _validate_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   max_utils.print_system_information()
