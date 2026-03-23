@@ -34,6 +34,9 @@ _config_lib, engine_api, _token_utils, _tokenizer_api, _token_params_ns = jetstr
 # Placeholder: internal
 
 # Number of text sequences to process in a single batch.
+# A batch is hardware limit (total slots), while _NUM_STREAMS is a counter of
+# how many slots are currently used.
+# It is 1 because decode.py is used to test and debug a single prompt.
 _NUM_STREAMS = 1
 
 
@@ -102,23 +105,60 @@ def main(argv: Sequence[str]) -> None:
   # Validate the config. Inference doesn't need full state (training/optimizer
   # metadata), it only needs weights. 
   _validate_config(config)
+  # config.shardy is a boolean flag (defaulting to True) defined in the MaxText
+  #  configuration system (at maxtext/configs/base.yml).
+  # It tells MaxText whether to use Shardy, which is JAX's modern "XLA backend"
+  # for partitioning code and data across many chips. JAX is currently
+  # transitioning from an older system called GSPMD to this newer Shardy system.
+  # As noted in the config file, Shardy became the default in JAX starting with
+  # version 0.7.0, and GSPMD is expected to be deprecated eventually.
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
+  # the log goes to absl.logging. It could be console, log stream of a process,
+  # or file configured via:
+  # python3 decode.py ... --logtostderr=false --log_dir=/path/to/logs
   max_utils.print_system_information()
-
+  # MaxEngine is the high-level coordinator in MaxText that bridges the gap
+  # between your raw model code and the high-performance inference environment. 
+  # The "Brain" of the inference system. It doesn't just run the model; it
+  # manages how the model is laid out across your hardware (TPUs/GPUs), how the
+  # memory (KV Cache) is recycled, and how multiple requests are batched
+  # together.
   engine = maxengine.MaxEngine(config)
   rng = jax.random.PRNGKey(1234)
   rng, rng_load_params = jax.random.split(rng)
+  # Load the weights and distribute them on device mesh. It also manages
+  # KV-cache and quantization.
   params = engine.load_params(rng_load_params)
+  # Initialize the profiler to trace the model execution.
+  # It captures metrics like XLA HLO traces and inter-chip communications.
   prof = profiler.Profiler(config)
 
+  # 3 sources of prompt in priority order:
+  # 1. Command line flag --prompt
+  # python3 decode.py base.yml prompt="The capital of France is"
+  # 2. Custom config file (e.g. llama2-7b.yml)
+  # 3. Default in base.yml
+  # e.g. prompt: "I love to"
   text = config.prompt
+  # Max prompt size. Default is 64 set in base.yml. If more is needed you need
+  # to change the config:
+  # python3 decode.py ... max_prefill_predict_length=1024
   prefill_length = config.max_prefill_predict_length
+  # preprocessor processes video or image input and converts the content to the
+  # numbers that the model can understand.
   processor_outputs = mm_utils.PreprocessorOutput()
   if config.use_multimodal:
+    # mm_processor processes multi-modal input (image, audio, video) based on
+    # different models' demands(Gemma, Lllma, Qwen, etc)
     processor_outputs = mm_processor.preprocess_mm_data(config)
+    # get_image_offsets calculates how many tokens all images will turn into.
+    # They vary from model to model. This function will calculate it based on
+    # the model's spec.
     image_offsets = mm_processor.get_image_offsets(config=config, processor_output=processor_outputs)
-
+    # Subtract the image offsets from the prefill length (token budget).
     prefill_length -= image_offsets
+    # Reformat the prompt to include/insert the image placeholders.
+    # See MEDIA.md
     text = mm_processor.reformat_prompt(
         prompt=config.prompt,
         image_placeholder=config.image_placeholder,
@@ -128,7 +168,14 @@ def main(argv: Sequence[str]) -> None:
         num_videos=getattr(processor_outputs, 'num_videos', 0),
     )
 
+  # Get the metadata of the tokenizer. e.g.
+  # path, token_type (sentencepiece of Llama, T5, huggingface for Mistral or
+  # Llama3, tiktoken for OpenAI style like GPT), access_token (for protected
+  # models), use_chat_template (for models that use chat template like quote)
   metadata = engine.get_tokenizer()
+
+  # Return the real tokenizer. Note that JetStream must be installed so
+  # "_IS_STUB" must be False.
   tokenizer_model = engine.build_tokenizer(metadata)
   token_params_is_stub = getattr(_token_params_ns, "_IS_STUB", False)
   engine_api_is_stub = getattr(engine_api, "_IS_STUB", False)
@@ -143,18 +190,37 @@ def main(argv: Sequence[str]) -> None:
     has_chat_template = getattr(tokenizer_model.tokenizer, "chat_template", False)  # pytype: disable=attribute-error
   except AttributeError as _:
     has_chat_template = False
+  # Converts input text to tokens:
+  # is_bos: Whether to add a beginning of sequence token.
+  # prefill_lengths: The length of the prompt, used to pad the rest of the array.
+  # Returns:
+  # tokens: The tokens of the prompt 1 x 64 array.
+  # true_length: The actual length of the prompt. Engine use it to know where
+  # the padding begins.
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
+  # Transformer processes all tokens in parallel. 
+  # position_ids is used to calculate the position of each token so the order can
+  # be restored.
   position_ids = None
+  # Multimodal RoPE (Rotary Position Embedding) positional deltas.
+  # It is always a 3-D tensor.
+  # See MROPE.md
   mrope_position_deltas = None
 
   if config.use_multimodal:
+    # Create placeholder tokens, often 256 tokens per image, to fill the token
+    # positions reserved for images. Those placeholder tokens will be replaced
+    # by the actual image tokens later.
+    # It also add Bookends tokens for Gemma 3. e.g.
+    # [\n, \n, <image_start>, ...256 placeholders..., <image_end>, \n, \n]
     tokens = mm_processor.prepare_text_for_image_fusion(tokens=tokens, config=config, processor_output=processor_outputs)
     true_length += image_offsets
 
     if config.use_mrope:
       from maxtext.multimodal import processor_qwen3_omni  # pylint: disable=import-outside-toplevel
-
+      # position_ids: 3D position IDs. Shape: (3, batch, seq_len).
+      # mrope_position_deltas: Position offset for each sequence. Shape: (batch, 1).
       position_ids, mrope_position_deltas = processor_qwen3_omni.get_rope_index(
           input_ids=tokens,
           image_grid_thw=processor_outputs.pixel_grid_thw,  # pytype: disable=attribute-error
@@ -206,13 +272,19 @@ def main(argv: Sequence[str]) -> None:
 
   # Insert
   rng, rng_init_decode = jax.random.split(rng)
+  # See INIT_DECODE_STATE.md
   decode_state = engine.init_decode_state(rng_init_decode)
   for i in range(_NUM_STREAMS):
+    # Insert the prefill cache into the decode state.
     decode_state = engine.insert(prefill_result_list[i], decode_state, slot=i)
 
   # Generate
   prof_deactivated = False
   steps = range(config.max_prefill_predict_length, config.max_target_length)
+  # first_token_list: list of 1st token results from prefill, 1 for each stream
+  # _batch_first_result_token: batch the first token results (4) into batch
+  # slots (8) and pad the empty slots with 0.
+  # sampled_tokens_list: list of sampled (produced) tokens from decode.
   sampled_tokens_list.append(_batch_first_result_token(first_token_list, batch_size))
   for i in steps:
     rng, rng_generate = jax.random.split(rng)

@@ -215,6 +215,7 @@ class MaxEngine(_BaseEngine):
         .compile(),
     )
 
+  # See LOAD_PARAMS.md
   def load_params(self, *args, params=None, rng: PRNGKeyType | None = None, **kwargs) -> Params:
     """Load Parameters from GCS or reshard given Parameters"""
     # pylint: disable=unused-argument
@@ -281,6 +282,7 @@ class MaxEngine(_BaseEngine):
 
     return params
 
+  # See LORA.md
   def load_single_adapter(self, adapter_path):
     """
     Load Single adapter from adapter_path.
@@ -1038,10 +1040,14 @@ class MaxEngine(_BaseEngine):
           mutable=["cache"],
           page_state=page_state,
       )
+    # Copies the logits generated from 1 chip to all other chips.
+    # In a microsecond, all chips will have the full 32000-word probability map.
     out_logits = jax.lax.with_sharding_constraint(out_logits, self.replicated_sharding)
+    # Copies the KV cache from 1 chip to all other chips.
     new_cache = jax.lax.with_sharding_constraint(new_vars["cache"], self.kv_cache_shardings)
     # sampling tokens
     rng, new_rng = jax.random.split(rng)
+    # See SAMPLING.md for more details.
     new_token = inference_utils.sampling(
         out_logits,
         new_rng,
@@ -1061,7 +1067,10 @@ class MaxEngine(_BaseEngine):
     generated_tokens = decode_state["generated_tokens"] + 1
 
     result = engine_api.ResultTokens(
+        # Concatenate the new token, validity, and answer length.
         data=jnp.concatenate((new_token, all_valid, generated_tokens), axis=1),
+        # The following _idx params are "Legend" of the data map.
+        # Note the j in tuple (i, j) is exclusive.
         # Tokens are shape [batch, speculations], so when we concatenate
         # tokens, validity and length along their index 1 dimension then they
         # occupy 0:speculations.
@@ -1205,6 +1214,9 @@ class MaxEngine(_BaseEngine):
         "token_logp": inserted_token_logp,
     }
 
+  # stgatic_argnums=(0, ): Treat the engine settings as constant.
+  # donate_argnames=("prefix", "decode_state"): Reuse the memory of the previous
+  # state so we don't run out of memory by copying states every time.
   @functools.partial(jax.jit, static_argnums=(0,), donate_argnames=("prefix", "decode_state"))
   def _insert_jit(
       self,
@@ -1215,7 +1227,19 @@ class MaxEngine(_BaseEngine):
       page_state_in: PageState | None = None,
   ) -> DecodeState:
     """Insert a single computed prefill cache into KV cache."""
+    # prefix/KV Cache is put in LogicallyPartitioned wrapper for sharding.
+    # It contains both the data and metadata (instructions for sharding)
+    # We unbox it here to get the actual Jax arrays. Otherwise reading will get
+    # an error.
     unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
+    # To make the prefill phase faster, high-performance model like Gemma 3
+    # often stack the memory of all layers into single giant block.
+    # To insert or generate, we need to unstack the cache and make it a
+    # dictionary structure like:
+    # layer_0: [data]
+    # layer_1: [data]
+    # ...
+    # See STACK_KV_CACHE.md.
     unboxed_prefix["cache"] = self._maybe_unstack_prefill_result_cache(unboxed_prefix["cache"])
 
     def copy(path, partial_cache, full_cache, annotations):
