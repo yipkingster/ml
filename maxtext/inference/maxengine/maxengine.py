@@ -1030,6 +1030,7 @@ class MaxEngine(_BaseEngine):
     rng, new_rng = jax.random.split(rng)
     # run one step generation
     with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
+      # See MODEL_APPLY.md for more details.
       out_logits, new_vars = self.model.apply(
           params | {"cache": decode_state["cache"]},
           previous_token,
