@@ -1620,8 +1620,12 @@ class MaxEngine(_BaseEngine):
 
     # pylint: disable=unused-argument
     def init(abstract_params, page_state):
+      num_beams = (
+          self.config.decode_num_beams if self.config.decode_sampling_strategy == "diverse_beam_search" else 1
+      )
+      total_batch_size = int(self.config.per_device_batch_size * self.mesh.size) * num_beams
       x = jnp.ones(
-          (int(self.config.per_device_batch_size * self.mesh.size), 1),
+          (total_batch_size, 1),
           dtype=jnp.int32,
       )
       dummy_image = jnp.ones(
@@ -1649,33 +1653,72 @@ class MaxEngine(_BaseEngine):
       )
 
       next_pos = jnp.zeros(
-          (int(self.config.per_device_batch_size * self.mesh.size), 1),
+          (total_batch_size, 1),
           dtype=jnp.int32,
       )
       generated_tokens = jnp.zeros(
-          (int(self.config.per_device_batch_size * self.mesh.size), 1),
+          (total_batch_size, 1),
           dtype=jnp.int32,
       )
       tokens = jnp.zeros(
-          (int(self.config.per_device_batch_size * self.mesh.size), 1),
+          (total_batch_size, 1),
           dtype=jnp.int32,
       )
       token_logp = jnp.zeros(
-          (int(self.config.per_device_batch_size * self.mesh.size), 1),
+          (total_batch_size, 1),
           dtype=jnp.float32,
       )
+      cumulative_logprobs = jnp.full(
+          (total_batch_size, 1),
+          -1e9,  # Start with very low probability for all but the first beam
+          dtype=jnp.float32,
+      )
+      # Set the first beam of each user to 0 logprob so it's the only one
+      # "active" at start. This trick will avoid all 4 beams starting with the
+      # same token at the beginning. So we can achieve diversity at the start.
+      if num_beams > 1:
+        cumulative_logprobs = cumulative_logprobs.at[::num_beams].set(0.0)
+      else:
+        cumulative_logprobs = jnp.zeros((total_batch_size, 1), dtype=jnp.float32)
+
+      beam_parents = jnp.arange(total_batch_size, dtype=jnp.int32).reshape((total_batch_size, 1))
+
       return {
-          "logits": jnp.zeros(
+        # The logits for the current token.
+        # The shape is (batch_size, 1, vocab_size). The 1 is make it consistent
+        # 3D array for both prefill and generate phase. In prefill, all N tokens
+        # are processed at the same time so the logits dimension is (batch, 1000
+        # , vocab_size). In generate phase, only 1 token is generated at a time
+        # so the logits dimension is (batch, 1, vocab_size).
+        "logits": jnp.zeros(
               (
-                  int(self.config.per_device_batch_size * self.mesh.size),
+                  total_batch_size,
                   1,
                   self.config.vocab_size,
               )
           ),
+          # The cumulative score of the path.
+          # (total_batch_size, 1)
+          "cumulative_logprobs": cumulative_logprobs,
+          # The parent beam index for re-sorting memory.
+          # (total_batch_size, 1)
+          "beam_parents": beam_parents,
+          # The KV cache for the model.
+          # Note the cache contains KV cache and other stats. Here we only take
+          # the KV cache. It is a dict of tensors.
           "cache": cache["cache"],
+          # The next position to be processed. 3D coordinates for the next word.
+          # (batch_size, 1). Since it only generates words, only one time-step
+          # dimension is needed.
           "next_pos": next_pos,
+          # Running counts of words generated so far.
+          # (batch_size, 1)
           "generated_tokens": generated_tokens,
+          # The ID of the tokens just generated.
+          # (batch_size, 1)
           "tokens": tokens,
+          # The log probability of the tokens just generated.
+          # (batch_size, 1)
           "token_logp": token_logp,
       }
 
