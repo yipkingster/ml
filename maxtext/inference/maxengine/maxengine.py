@@ -586,6 +586,7 @@ class MaxEngine(_BaseEngine):
         "tokens": first_generated_token,
         "prompt_logp": prompt_logp,
         "token_logp": token_logp,
+        "is_dbs": jnp.full((1,), (algorithm if algorithm is not None else self.config.decode_sampling_strategy) == "diverse_beam_search"),
     }, result
 
   # Public non-JIT prefill method that updates page state
@@ -810,6 +811,7 @@ class MaxEngine(_BaseEngine):
         "next_pos": next_pos,
         "generated_tokens": generated_tokens,
         "tokens": first_generated_tokens,
+        "is_dbs": jnp.full((1,), (algorithm if algorithm is not None else self.config.decode_sampling_strategy) == "diverse_beam_search"),
     }, result
 
   @functools.partial(
@@ -980,6 +982,24 @@ class MaxEngine(_BaseEngine):
 
     return max_utils.unbox_logicallypartioned(new_state), result
 
+  def reorder_cache(self, cache, parent_indices):
+    """Reorder the KV cache based on selected beam parents.
+
+    Args:
+      cache: The current KV cache state (a nested JAX tree).
+      parent_indices: The indices of the parent beams for every slot.
+        Shape: [total_batch_size, 1].
+
+    Returns:
+      The reordered KV cache.
+    """
+    def reorder_tensor(tensor):
+      # We use jnp.take to gather the winning parents' memories into the
+      # current slots. The 'axis=0' ensures we are reordering the batch.
+      return jnp.take(tensor, parent_indices.squeeze(axis=-1), axis=0)
+
+    return jax.tree_util.tree_map(reorder_tensor, cache)
+
   @functools.partial(
       jax.jit, static_argnums=(0,), donate_argnums=(2,), static_argnames=("algorithm", "topk", "nucleus_topp")
   )
@@ -1026,9 +1046,15 @@ class MaxEngine(_BaseEngine):
           token and its metadata.
     """
 
+    # This field in the state dictionary stores the most recent token that was
+    # produced by the model (either from the initial prefill phase or the
+    # previous decoding step).
     previous_token = decode_state["tokens"]
     rng, new_rng = jax.random.split(rng)
-    # run one step generation
+    # run one step generation 
+    # _mesh the TPUs to use. axis_rules tells the TPUs how to split the model.
+    # e.g. attention layers are split across chips 0-3, and MLP layers are split
+    # across chips 4-7.
     with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       # See MODEL_APPLY.md for more details.
       out_logits, new_vars = self.model.apply(
@@ -1043,19 +1069,51 @@ class MaxEngine(_BaseEngine):
       )
     # Copies the logits generated from 1 chip to all other chips.
     # In a microsecond, all chips will have the full 32000-word probability map.
+    # replicated_sharding is defined as jax.sharding.NamedSharding(mesh, P(None))
+    # P(None) means that the array is replicated across all chips
+    # (no partitioning).
     out_logits = jax.lax.with_sharding_constraint(out_logits, self.replicated_sharding)
     # Copies the KV cache from 1 chip to all other chips.
     new_cache = jax.lax.with_sharding_constraint(new_vars["cache"], self.kv_cache_shardings)
     # sampling tokens
     rng, new_rng = jax.random.split(rng)
-    # See SAMPLING.md for more details.
-    new_token = inference_utils.sampling(
+    
+    current_algorithm = algorithm if algorithm is not None else self.config.decode_sampling_strategy
+    
+    is_dbs = decode_state["is_dbs"]
+
+    def dbs_sampling_branch(logits, cur_state):
+      new_tok, new_sco, par_idx = inference_utils.sampling_dbs(
+          logits,
+          cur_state["cumulative_logprobs"],
+          self.config.decode_num_beams,
+          self.config.decode_num_beam_groups,
+          self.config.decode_diversity_penalty,
+          topk=topk if topk is not None else self.config.decode_sampling_top_k,
+      )
+      # Execution of the "Memory Swap"
+      updated_cache = self.reorder_cache(new_cache, par_idx)
+      return new_tok, new_sco, par_idx, updated_cache
+
+    def standard_sampling_branch(logits, cur_state):
+      new_tok = inference_utils.sampling(
+          logits,
+          new_rng,
+          current_algorithm,
+          topk=topk if topk is not None else self.config.decode_sampling_top_k,
+          nucleus_topp=nucleus_topp if nucleus_topp is not None else self.config.decode_sampling_nucleus_p,
+          temperature=temperature if temperature is not None else self.config.decode_sampling_temperature,
+      )
+      return new_tok, cur_state.get("cumulative_logprobs"), cur_state.get("beam_parents"), new_cache
+
+    # Select branch based on 'is_dbs' in decode_state. 
+    # This enforces that the algorithm cannot change once set.
+    new_token, cumulative_logprobs, beam_parents, final_cache = jax.lax.cond(
+        is_dbs[0],
+        dbs_sampling_branch,
+        standard_sampling_branch,
         out_logits,
-        new_rng,
-        algorithm if algorithm is not None else self.config.decode_sampling_strategy,
-        topk=topk if topk is not None else self.config.decode_sampling_top_k,
-        nucleus_topp=nucleus_topp if nucleus_topp is not None else self.config.decode_sampling_nucleus_p,
-        temperature=temperature if temperature is not None else self.config.decode_sampling_temperature,
+        decode_state,
     )
     all_valid = jnp.ones(new_token.shape, dtype=jnp.int8)
     if self.config.return_log_prob:
@@ -1091,6 +1149,9 @@ class MaxEngine(_BaseEngine):
         "generated_tokens": generated_tokens,
         "tokens": new_token,
         "token_logp": token_logp,
+        "cumulative_logprobs": cumulative_logprobs,
+        "beam_parents": beam_parents,
+        "is_dbs": is_dbs,
     }, result
 
   @functools.partial(
@@ -1213,6 +1274,7 @@ class MaxEngine(_BaseEngine):
         "generated_tokens": inserted_generated_tokens,
         "tokens": inserted_tokens,
         "token_logp": inserted_token_logp,
+        "is_dbs": unboxed_prefix["is_dbs"],
     }
 
   # stgatic_argnums=(0, ): Treat the engine settings as constant.
@@ -1360,6 +1422,7 @@ class MaxEngine(_BaseEngine):
         "generated_tokens": inserted_generated_tokens,
         "tokens": inserted_tokens,
         "token_logp": inserted_token_logp,
+        "is_dbs": unboxed_prefix["is_dbs"],
     }
 
   def insert(
