@@ -27,8 +27,9 @@ config_lib, engine_api, token_utils, tokenizer_api, token_params_ns = jetstream(
 
 jetstream_is_stub = getattr(config_lib, "_IS_STUB", False) or getattr(engine_api, "_IS_STUB", False)
 
-if is_decoupled() and jetstream_is_stub:
-  raise RuntimeError("prefill_packing imported while DECOUPLE_GCLOUD=TRUE. This module depends on JetStream.")
+# We do not validate the DECOUPLED_GCLOUD=true and jetstream_is_stub flags.
+# This allows us to run the model in a decoupled environment and only fail if
+# the user actually tries to use the prefill packing feature.
 
 import warnings
 import logging

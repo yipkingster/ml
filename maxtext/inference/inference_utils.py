@@ -286,7 +286,7 @@ def sample_diverse_beam_search_step(
     raise ValueError(
         f"num_beams ({num_beams}) must be divisible by num_groups ({num_groups})"
     )
-  if pool_size is None:
+  if pool_size is None or pool_size <= 0:
     pool_size = num_beams
 
   total_batch_size = logits.shape[0]
@@ -330,7 +330,7 @@ def sample_diverse_beam_search_step(
         # converted/flattened to (user_batch, beams_per_group, pool_size)
         current_token_ids.reshape((user_batch_size, -1, pool_size)), 
         axis=2
-    ).reshape((user_batch_size, num_groups, beams_per_group, pool_size))
+    ).reshape((user_batch_size, beams_per_group, pool_size))
     
     # penalized_scores shape: (user_batch, 1, beams_per_group, pool_size)
     penalized_scores = group_pool_scores[:, g, :, :] - (penalties * diversity_penalty)

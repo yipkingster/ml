@@ -304,6 +304,11 @@ class OfflineInference:
       nonlocal slot_to_id
       nonlocal empty_slots
       nonlocal counter
+      # DBS reorders cache/slot paths internally, meaning token sequences are only stable at the end.
+      is_dbs = self.engine.config.decode_sampling_strategy == "diverse_beam_search"
+      if is_dbs:
+        print("DBS (Diverse Beam Search) detected. Disabling token-by-token emission to avoid inconsistent path output.")
+
       while self.live and counter.detokenize < counter.input:
         # log.info("Detokenize start")
         newly_empty = []

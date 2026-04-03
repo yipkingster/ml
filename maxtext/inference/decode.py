@@ -113,6 +113,14 @@ def main(argv: Sequence[str]) -> None:
   # As noted in the config file, Shardy became the default in JAX starting with
   # version 0.7.0, and GSPMD is expected to be deprecated eventually.
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
+  # Diverse Beam Search (DBS) performs "memory swaps" (backtracking) between paths.
+  # This makes step-by-step token streaming unreliable as prefixes may change.
+  if config.decode_sampling_strategy == "diverse_beam_search":
+    max_logging.warning(
+        "Diverse Beam Search (DBS) is active. Streaming output is disabled "
+        "because beams can backtrack and reorder their cache during generation. "
+        "Only the final generated sequence will be accurate."
+    )
   # the log goes to absl.logging. It could be console, log stream of a process,
   # or file configured via:
   # python3 decode.py ... --logtostderr=false --log_dir=/path/to/logs

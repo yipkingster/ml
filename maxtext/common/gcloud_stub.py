@@ -158,6 +158,9 @@ def _jetstream_stubs():
     def __init__(self, *a, **k):  # pylint: disable=unused-argument
       pass
 
+  from jax.tree_util import register_pytree_node_class
+
+  @register_pytree_node_class
   class ResultTokens:
     """Container for result token arrays used by JetStream."""
 
@@ -179,6 +182,20 @@ def _jetstream_stubs():
       self.length_idx = length_idx
       self.log_prob = log_prob
       self.samples_per_slot = samples_per_slot
+
+    def tree_flatten(self):
+      return (self.data, self.log_prob), (self.tokens_idx, self.valid_idx, self.length_idx, self.samples_per_slot)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+      return cls(
+          data=children[0],
+          log_prob=children[1],
+          tokens_idx=aux_data[0],
+          valid_idx=aux_data[1],
+          length_idx=aux_data[2],
+          samples_per_slot=aux_data[3],
+      )
 
   # Tokenizer placeholders (unused in decoupled tests due to runtime guard).
   class TokenizerParameters:  # pragma: no cover - placeholder

@@ -1014,13 +1014,18 @@ def get_batch_seq_len_for_mode(config, model_mode):
     A tuple of (batch_size, seq_len).
   """
   if model_mode == MODEL_MODE_PREFILL:
-    # Prefill mode: Process one full-length prompt.
-    batch_size = 1
+    # Prefill mode: Process sequences in the batch.
+    # This allows memory for N beams allocated for Diverse Beam Search, and make
+    # it consistent for non DBS use cases.
+    batch_size = config.per_device_batch_size
     seq_len = config.max_prefill_predict_length
 
   elif model_mode == MODEL_MODE_AUTOREGRESSIVE:
     # Autoregressive/decode mode: Generate one token at a time for a batch.
-    batch_size = config.micro_batch_size_to_train_on
+    # This was using older config micro_batch_size_to_train_on, which sometimes
+    # diverges from batch per device. Now we use per_device_batch_size to be 
+    # consistent across the board.
+    batch_size = config.per_device_batch_size
     seq_len = 1
 
   elif model_mode == MODEL_MODE_TRAIN:

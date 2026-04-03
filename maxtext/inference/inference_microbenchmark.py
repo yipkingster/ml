@@ -309,8 +309,16 @@ def run_benchmarks(config):
   benchmark_loop_iters = config.inference_microbenchmark_loop_iters
 
   text = config.prompt
-  metadata = engine.get_tokenizer()
-  tokenizer_model = engine.build_tokenizer(metadata)
+  tokenizer_model = None
+  # This "if" is more stable when DECOUPLE_GCLOUD=TRUE because the tokenizer is
+  # stubbed out in that mode.
+  # Caviar: If you were to run a custom stage in the benchmark that assumed
+  # tokenizer_model was always defined without checking, it would fail. However,
+  # looking at the existing file, only the prefill stages actually consume
+  # tokenizer_model.
+  if "prefill" in stages_to_benchmark or "prefill-multisampling" in stages_to_benchmark:
+    metadata = engine.get_tokenizer()
+    tokenizer_model = engine.build_tokenizer(metadata)
   rng, rng_init_decode = jax.random.split(rng)
 
   generate_executable, params, decode_state_executable = engine.aot_compile(params, pass_rng_shape=True)

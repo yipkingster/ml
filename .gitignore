@@ -131,3 +131,13 @@ notebook.ipynb
 .kaggle-outputs/my_notebook3/notebook9293550c4d.ipynb
 remote_notebooks/yipking__notebook9293550c4d/notebook9293550c4d.ipynb
 .kaggle-outputs/t5x
+maxtext/__pycache__/*
+maxtext/common/__pycache__/*
+maxtext/configs/__pycache__/*
+maxtext/inference/__pycache__/*
+maxtext/models/__pycache__/*
+maxtext/multimodal/__pycache__/*
+maxtext/utils/__pycache__/*
+maxtext/inference/maxengine/__pycache__/*
+maxtext/input_pipeline/__pycache__/*
+*.pyc

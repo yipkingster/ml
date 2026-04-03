@@ -15,6 +15,7 @@
 """Implementation of Engine API for MaxText."""
 
 from collections import defaultdict
+import copy
 from typing import Any, Callable
 import functools
 import os.path
@@ -113,7 +114,19 @@ class MaxEngine(_BaseEngine):
 
     # Model and Optimizer definition
     quant = quantizations.configure_quantization(config)
-    self.model = models.transformer_as_linen(config, mesh=self._mesh, quant=quant, model_mode=MODEL_MODE_PREFILL)
+    
+    # Diverse Beam Search requires more KV cache slots (batch size * num_beams).
+    # We must ensure the model's layers are initialized with this larger batch size.
+    self.config = config
+    if config.decode_sampling_strategy == "diverse_beam_search":
+      from types import SimpleNamespace
+      self.config = SimpleNamespace(**config.get_keys())
+      self.config.per_device_batch_size *= config.decode_num_beams
+      self.config.batch_size *= config.decode_num_beams
+      self.config.micro_batch_size_to_train_on *= config.decode_num_beams
+      self.config.get_keys = lambda: {k: v for k, v in vars(self.config).items() if k != "get_keys"}
+    
+    self.model = models.transformer_as_linen(self.config, mesh=self._mesh, quant=quant, model_mode=MODEL_MODE_PREFILL)
     self.replicated_sharding = jax.sharding.NamedSharding(self._mesh, P(None))
 
     self.abstract_params = None
@@ -1096,10 +1109,13 @@ class MaxEngine(_BaseEngine):
       return new_tok, new_sco, par_idx, updated_cache
 
     def standard_sampling_branch(logits, cur_state):
+      branch_algorithm = current_algorithm
+      if dbs_requested:
+        branch_algorithm = "greedy"
       new_tok = inference_utils.sampling(
           logits,
           new_rng,
-          current_algorithm,
+          branch_algorithm,
           topk=topk if topk is not None else self.config.decode_sampling_top_k,
           nucleus_topp=nucleus_topp if nucleus_topp is not None else self.config.decode_sampling_nucleus_p,
           temperature=temperature if temperature is not None else self.config.decode_sampling_temperature,
@@ -1107,14 +1123,21 @@ class MaxEngine(_BaseEngine):
       return new_tok, cur_state.get("cumulative_logprobs"), cur_state.get("beam_parents"), new_cache
 
     # Select branch based on 'is_dbs' in decode_state. 
-    # This enforces that the algorithm cannot change once set.
-    new_token, cumulative_logprobs, beam_parents, final_cache = jax.lax.cond(
-        is_dbs[0],
-        dbs_sampling_branch,
-        standard_sampling_branch,
-        out_logits,
-        decode_state,
-    )
+    # We only include the DBS branch if beams are actually being used 
+    # AND the strategy matches, to avoid tracing errors in Greedy mode.
+    dbs_requested = (self.config.decode_num_beams > 1 and 
+                     self.config.decode_sampling_strategy == "diverse_beam_search")
+
+    if dbs_requested:
+      new_token, cumulative_logprobs, beam_parents, final_cache = dbs_sampling_branch(
+          out_logits,
+          decode_state,
+      )
+    else:
+      new_token, cumulative_logprobs, beam_parents, final_cache = standard_sampling_branch(
+          out_logits,
+          decode_state,
+      )
     all_valid = jnp.ones(new_token.shape, dtype=jnp.int8)
     if self.config.return_log_prob:
       token_logp = inference_utils.log_prob_of_chosen_token(out_logits, new_token)
@@ -1683,22 +1706,24 @@ class MaxEngine(_BaseEngine):
 
     # pylint: disable=unused-argument
     def init(abstract_params, page_state):
+      init_config = self.config
       num_beams = (
           self.config.decode_num_beams if self.config.decode_sampling_strategy == "diverse_beam_search" else 1
       )
-      total_batch_size = int(self.config.per_device_batch_size * self.mesh.size) * num_beams
+
+      total_batch_size = int(init_config.per_device_batch_size * self.mesh.size)
       x = jnp.ones(
           (total_batch_size, 1),
           dtype=jnp.int32,
       )
       dummy_image = jnp.ones(
           mm_processor.get_dummy_image_shape_for_init(
-              model_name=self.config.model_name, batch_size=self.config.per_device_batch_size
+              model_name=init_config.model_name, batch_size=init_config.per_device_batch_size
           ),
           dtype=jnp.int32,
       )
       dummy_audio = jnp.ones(
-          mm_processor.get_dummy_audio_shape_for_init(self.config),
+          mm_processor.get_dummy_audio_shape_for_init(init_config),
           dtype=jnp.float32,
       )
       _, cache = self.model.apply(
@@ -1783,6 +1808,7 @@ class MaxEngine(_BaseEngine):
           # The log probability of the tokens just generated.
           # (batch_size, 1)
           "token_logp": token_logp,
+          "is_dbs": jnp.full((1,), self.config.decode_sampling_strategy == "diverse_beam_search"),
       }
 
     with nn_partitioning.axis_rules(self.config.logical_axis_rules):

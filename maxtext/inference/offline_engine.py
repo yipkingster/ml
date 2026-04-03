@@ -617,14 +617,33 @@ class InferenceWorker:
         # Block on the last token
         jax.block_until_ready(result_tokens)
 
-        # Queue detokenization task
-      task = DetokenizationTask(
-          task_type="decode",
-          tokens_buffer=result_tokens,
-          logprob_buffer=log_prob,
-      )
-
-      self.detokenization_queue.put_nowait(task)
+      # Queue detokenization task – only if not using DBS to avoid "streaming jitter".
+      # For DBS, sequences are only final at the end because beams can reorder.
+      if not (self.config.decode_sampling_strategy == "diverse_beam_search"):
+        task = DetokenizationTask(
+            task_type="decode",
+            tokens_buffer=result_tokens,
+            logprob_buffer=log_prob,
+        )
+        self.detokenization_queue.put_nowait(task)
+      else:
+        # Buffer locally in completions
+        with jax.profiler.TraceAnnotation("buffer_dbs_tokens"):
+          result_tokens_np = np.array(result_tokens)
+          log_prob_np = np.array(log_prob)
+          # Go through every slot in this batch.
+          for slot, id_ in self.slot_to_id.items():
+            # If the slot is occupied and the sequence is not completed, which
+            # means it is active, add token to the completion buffer.
+            if id_ is not None and id_ not in self.completed_sequences:
+              self.completion_tokens_by_id[id_].append(
+                  TokenOutput(np.array(result_tokens_np[slot]), np.array(log_prob_np[slot]))
+              )
+              # Check for EOS or max length to mark completion
+              if int(result_tokens_np[slot]) in self.eos_ids or len(self.completion_tokens_by_id[id_]) >= self.max_decode_length:
+                 # Tells the engine to stop generating for this sequence and
+                 # ignore it in the next loop iteration.
+                 self.completed_sequences.add(id_)
 
   @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(2,))
   def _jitted_generate_fn(self, params, decode_state, rng):
