@@ -10,7 +10,35 @@ Currently, MaxText primarily supports greedy and probabilistic sampling strategi
 **Note on Streaming**: Implementing DBS requires sacrificing real-time streaming capability. Because beams can be reordered at any step based on their cumulative scores, the "best" token for a given position might change as the sequence progresses. Therefore, sequences are only finalized once the entire generation process is complete.
 
 ## 2. The Mathematics of DBS
-[Section reserved for mathematical formulations of beam scoring and diversity penalties.]
+
+The implementation is based on the paper [Diverse Beam Search: Decoding Diverse Solutions from Neural Sequence Models (Vijayakumar et al., 2016)](https://arxiv.org/abs/1610.02424).
+
+### Standard Beam Search Objective
+Since seeking the best probability of a sequence over the entire space of possible sequences is computationally impossible, standard BS acts as a greedy heuristic optimization across $B$ parallel beams (the `num_decodes`). At each time step $t$, it attempts to find the set of next tokens across all beams $Y_{[t]}$ that locally maximizes the probabilities when extending the previous sequence step states:
+
+$$ \mathbf{Y}_{[t]} = \arg\max_{y_1^{[t]}, \ldots, y_B^{[t]} \in \mathcal{V} \text{ s.t. } y_i^{[t]} \neq y_j^{[t]}} \sum_{b=1}^B \log P(y_b^{[t]} \mid Y_{b, [t-1]}, X) $$
+
+Here is the piece by piece explanation:
+1. $B$ is the number of active beams.
+2. The superscript $[t]$ placed in brackets (as in $y^{[t]}$ or $\mathbf{Y}_{[t]}$) denotes the **time step** index of the sequence generation process. For example, $y_b^{[t]}$ represents the single token being evaluated exactly at time step $t$ for beam $b$.
+3. The "s.t." in the term $\text{s.t. } y_i^{[t]} \neq y_j^{[t]}$ means "subject to". It simply forces the algorithm to select $B$ distinct candidate tokens in each beam, avoiding duplication at a single timestep. 
+4. The summation run $\sum_{b=1}^B$ means the algorithm searches for a **set** of next-tokens that maximizes the probabilities across all $B$ concurrently active beam-branches strictly localized at step $t$.
+5. $\log P$ ("Log-Probability"): The natural logarithm of the probability score assigned by the neural network.  We use the sum of log-probabilities instead of product of raw probabilities to avoid numerical underflow by multiplying many small numbers together.
+6. ($y_b^{[t]} \mid Y_{b, [t-1]}, X$): Given the prompt/input $X$ (e.g. the translating sentence) and the previous context $Y_{b, [t-1]}$ leading up to this point within beam $b$, we find the specific next token $y_b^{[t]}$ that maximizes that beam's conditional probability.
+
+### Diverse Beam Search Objective
+DBS partitions the total beams ($B$) into groups ($G$). It optimizes these groups sequentially at each time step. The first group ($g=1$) acts like standard BS. For any subsequent group $g$, a penalty $\Delta$ is applied to discourage the selection of tokens that were already chosen by the previous groups $\{1, \ldots, g-1\}$ at that identical timestep $t$.
+
+$$ \mathbf{Y}_{[t]}^{[g]} = \arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}} \sum_{b=1}^{B'} \left( \log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X) + \lambda \sum_{h=1}^{g-1} \Delta(y_b^{[t]}, y_{b}^{[t], [h]}) \right) $$
+
+Here is the piece by piece explanation:
+1. $\mathbf{Y}_{[t]}^{[g]}$ ("Y at step t for group g"): The set of $B'$ tokens chosen for group $g$ at time step $t$.
+2. $\arg\max_{y_1^{[t]}, \ldots, y_{B'}^{[t]} \in \mathcal{V}}$: The $\arg\max$ function. It looks through the entire vocabulary ($\mathcal{V}$) to find the next-tokens that maximize the total score of the summation next to it.
+3. $\sum_{b=1}^{B'}$: We sum the scores across all $B'$ parallel beam groups. (Where $B'$ is simply the total beams $B$ divided by the number of groups $G$).
+4. $\log P(y_b^{[t]} \mid Y_{b,[t-1]}^{[g]}, X)$: The log-probability that the model's neural network assigns to the candidate token $y_b^{[t]}$, given the original prompt $X$ and the sequence selected before this timestep for this specific beam group $g$: $Y_{b,[t-1]}^{[g]}$.
+5. $\lambda$: The `diversity_strength` penalty multiplier. It controls how severely we want to punish the model for duplicate tokens.
+6. $\sum_{h=1}^{g-1}$: A loop that iterates through every single previous group ($h$) that has already been decided at this particular step $t$ (from group $1$ up to $g-1$).
+7. $\lambda \sum \Delta(y_b^{[t]}, y_{b}^{[t], [h]})$: The **Hamming Diversity Penalty**. By multiplying the number of occurrences of this token by $\lambda$, we subtract a penalty proportional to how many times the exact same token has already been selected by older groups at this time step.
 
 ## 3. Design of the DBS Implementation
 The integration required significant changes across four core areas of the MaxText engine:
@@ -44,7 +72,7 @@ During the implementation, several critical hurdles were overcome:
 *   **JIT Tracing Collisions (`jax.lax.cond`)**: JAX's `cond` traces both branches, leading to shape errors when the DBS branch (Batch 4) was compared to the Standard branch (Batch 1). Resolve: Replaced `jax.lax.cond` with a static Python `if` statement based on a `dbs_requested` flag, ensuring only the correctly-sized path is compiled for a given configuration.
 *   **Tracer Conversion Failures**: We initially tried to use the traced `is_dbs` array in Python `if` blocks, which is disallowed in JIT. Resolve: Switched to the static `dbs_requested` boolean derived from the immutable configuration.
 
-## 5. Limitations and Design Constraints
+## 5. Limitations and Constraints
 The current implementation of DBS has several important constraints:
 
 *   **Streaming Disabled**: Real-time streaming is intentionally disabled for DBS to avoid "streaming jitter" where the printed output might change as different beams become the global winner.
